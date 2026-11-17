@@ -7,6 +7,7 @@ exercise so you can rebuild or extend it yourself.
 - [Chapter 1: A container runtime from scratch](#chapter-1-a-container-runtime-from-scratch)
 - [Chapter 2: The node agent](#chapter-2-the-node-agent)
 - [Chapter 3: The control plane](#chapter-3-the-control-plane)
+- [Chapter 4: minictl, a small kubectl](#chapter-4-minictl-a-small-kubectl)
 
 ---
 
@@ -568,3 +569,167 @@ Chapter 4 replaces those `curl` calls with a proper CLI.
 - How does a rolling update avoid downtime? (maxSurge, maxUnavailable,
   readiness.)
 - What is `resourceVersion` for? (Optimistic concurrency, and resuming watches.)
+
+---
+
+## Chapter 4: minictl, a small kubectl
+
+**Code:** `cmd/minictl/`, `internal/manifest/`, `examples/`
+
+### What it does
+
+```
+minictl apply -f FILE                     create or update objects from YAML
+minictl get pods|nodes|deployments [-o json]
+minictl logs POD
+minictl scale deployment NAME REPLICAS
+minictl delete pod|deployment NAME
+```
+
+This is a real session on a two-node cluster, using the files in `examples/`:
+
+```text
+$ minictl apply -f examples/hello.yaml
+deployment/hello created
+$ minictl apply -f examples/oom.yaml
+pod/memory-hog created
+$ minictl apply -f examples/crash.yaml
+pod/crasher created
+
+$ minictl get pods
+NAME          STATUS             RESTARTS   NODE    AGE
+crasher       CrashLoopBackOff   3          node1   8s
+hello-98z6d   Running            0          node1   7s
+hello-h879b   Running            0          node2   7s
+hello-vnt2w   Running            0          node1   7s
+memory-hog    OOMKilled          0          node1   8s
+
+$ minictl logs hello-98z6d
+hello from hello-98z6d
+still alive
+
+# stop node2's agent, wait 15 seconds
+$ minictl get nodes
+NAME    STATUS     CPU     MEMORY   LAST HEARTBEAT
+node1   Ready      2000m   1024Mi   1s ago
+node2   NotReady   2000m   1024Mi   15s ago
+
+$ minictl get pods
+NAME          STATUS             RESTARTS   NODE    AGE
+crasher       CrashLoopBackOff   5          node1   22s
+hello-5f274   Running            0          node1   4s     <- replacement
+hello-98z6d   Running            0          node1   21s
+hello-vnt2w   Running            0          node1   21s
+memory-hog    OOMKilled          0          node1   22s
+```
+
+Every line of that output comes from something built in chapters 1 to 3:
+`OOMKilled` is the cgroup's `oom_kill` counter, `CrashLoopBackOff` and the
+restart count come from the agent's backoff, and `hello-5f274` was created by
+the deployment controller after the node controller evicted `hello-h879b`
+from the dead node.
+
+### Concept 1: The CLI is just another API client
+
+`minictl` has no special powers. Every command is an HTTP request to the API
+server, exactly like the scheduler or an agent makes. `kubectl` is the same:
+run any kubectl command with `-v=8` and you will see the raw HTTP requests.
+This is why you can manage Kubernetes from scripts, CI pipelines or your own
+programs with no extra server-side work.
+
+### Concept 2: Declarative vs. imperative
+
+There are two ways to tell a system what to do:
+
+- **Imperative**: "create a pod", "add 2 replicas", "delete that one". You
+  describe the *steps*. `minictl scale` and `minictl delete` work this way.
+- **Declarative**: "here is how things should look". You describe the *end
+  state*, and the system works out the steps. `minictl apply -f` works this
+  way: applying the same file twice is safe (the second time it just says
+  `configured`), and changing `replicas: 3` to `5` in the file and applying
+  again is how you scale.
+
+Declarative files can be stored in Git, reviewed in pull requests, and
+re-applied after a disaster to rebuild everything. That practice is called
+**GitOps**, and it only works because the controllers (chapter 3) reconcile
+toward desired state instead of executing commands.
+
+### Concept 3: Manifests
+
+`internal/manifest` turns YAML into API objects. The format is a simplified
+Kubernetes manifest:
+
+```yaml
+kind: Deployment
+name: hello
+replicas: 3
+template:
+  image: alpine
+  command: ["sh", "-c", "echo hello from $(hostname); sleep 3600"]
+  limits: {cpu: 100m, memory: 32Mi}
+```
+
+Two details worth copying in your own tools:
+
+- **Strict parsing.** `KnownFields(true)` makes a typo like `replica: 3` an
+  error. Without it, YAML libraries silently ignore unknown keys, and you
+  would get 1 replica and no idea why. Kubernetes added the same strictness
+  ("field validation") in version 1.25 after years of exactly this confusion.
+- **Human units.** `100m` and `32Mi` are parsed by the same `ParseCPU` and
+  `ParseMemory` functions the runtime uses, so a quantity means the same thing
+  everywhere.
+
+Several objects can live in one file separated by `---`.
+
+### Concept 4: Read-modify-write with retries
+
+`minictl scale` reads the Deployment, changes `replicas`, and writes it back
+with the `resourceVersion` it read. If the controller (which also writes the
+Deployment's status) or another user wrote in between, the server answers
+**409 Conflict**, and `scale` simply reads again and retries, up to 5 times.
+This retry loop is the standard way to use optimistic concurrency (chapter 3).
+In client-go, Kubernetes' Go library, it is literally called
+`retry.RetryOnConflict`.
+
+`apply`, on the other hand, deliberately sends no version: "make it look like
+my file" should win over whatever is there.
+
+### Concept 5: Logs come from the node
+
+`minictl logs POD` asks the API server which node runs the pod and where that
+node's agent listens (`Node.Address`, sent with every heartbeat), then fetches
+the log from the agent directly (chapter 2). The API server never handles log
+data.
+
+### Concept 6: Making a CLI testable
+
+`main()` is one line: `os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))`.
+All the logic is in `run`, which takes arguments and writers and returns an
+exit code. Tests call `run` directly and inspect the output as strings, with
+no subprocesses. `main_test.go` starts a real control plane and an agent
+(with fake containers) in the test process and walks through apply, get,
+logs, scale and delete, plus error messages like `pod "nope" not found`.
+`TestExamplesParse` applies every file in `examples/`, so an example can
+never silently break.
+
+### Exercises
+
+1. **`minictl describe pod NAME`**: print every field of a pod, including the
+   last exit code and message.
+2. **`minictl get pods -w`**: refresh the table every second (or use the watch
+   API if you did the chapter 3 exercise).
+3. **Label selectors**: `minictl get pods -l deployment=hello`.
+4. **`minictl apply` pruning**: delete Deployments that were created from a
+   directory but are no longer in it (what `kubectl apply --prune` does).
+5. **`minictl exec POD -- CMD`**: run a command inside a running container.
+   You'll need the agent to call `setns()` on the container's namespaces,
+   found under `/proc/<pid>/ns/`.
+
+### Interview questions this chapter prepares you for
+
+- What is the difference between `kubectl create` and `kubectl apply`?
+- What does "declarative" mean in Kubernetes, and why does it matter for
+  GitOps?
+- `kubectl get pods` shows `OOMKilled`. What happened and what do you change?
+  (The container hit its memory limit; raise `limits.memory` or fix the leak.)
+- How does `kubectl logs` work under the hood?

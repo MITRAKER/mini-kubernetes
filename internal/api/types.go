@@ -73,6 +73,8 @@ type Pod struct {
 	// read lets the API server reject your update if someone else changed
 	// the object in between (optimistic concurrency).
 	ResourceVersion int64 `json:"resourceVersion,omitempty"`
+	// Created is set by the API server when the pod is created.
+	Created time.Time `json:"created"`
 	// Labels are free-form tags. Controllers use them to find the pods
 	// they own.
 	Labels map[string]string `json:"labels,omitempty"`
@@ -88,6 +90,7 @@ type Pod struct {
 type Deployment struct {
 	Name            string           `json:"name"`
 	ResourceVersion int64            `json:"resourceVersion,omitempty"`
+	Created         time.Time        `json:"created"`
 	Replicas        int              `json:"replicas"`
 	Template        PodSpec          `json:"template"`
 	Status          DeploymentStatus `json:"status"`

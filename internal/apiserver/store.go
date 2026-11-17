@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/MITRAKER/mini-kubernetes/internal/api"
 )
@@ -121,6 +122,7 @@ func (s *Store) CreatePod(p api.Pod) (api.Pod, error) {
 		return p, ErrExists
 	}
 	p.ResourceVersion = s.nextVersion()
+	p.Created = time.Now()
 	p.Status = api.PodStatus{Phase: api.PodPending}
 	s.data.Pods[p.Name] = p
 	return p, s.save()
@@ -213,6 +215,9 @@ func (s *Store) ApplyDeployment(d api.Deployment) (api.Deployment, error) {
 			return old, ErrConflict
 		}
 		d.Status = old.Status // status is owned by the controller
+		d.Created = old.Created
+	} else {
+		d.Created = time.Now()
 	}
 	d.ResourceVersion = s.nextVersion()
 	s.data.Deployments[d.Name] = d

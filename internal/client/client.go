@@ -30,8 +30,13 @@ import (
 	"github.com/MITRAKER/mini-kubernetes/internal/api"
 )
 
-// ErrNotFound is returned when the object does not exist.
-var ErrNotFound = errors.New("not found")
+// Errors for the API server's answers that callers act on.
+var (
+	ErrNotFound = errors.New("not found") // 404
+	// ErrConflict means the object already exists, or changed since you
+	// read it. Read it again and retry.
+	ErrConflict = errors.New("conflict") // 409
+)
 
 // Client is an API server client.
 type Client struct {
@@ -68,7 +73,10 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 	}
 	if resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, bytes.TrimSpace(msg))
+		if resp.StatusCode == http.StatusConflict {
+			return fmt.Errorf("%w: %s", ErrConflict, bytes.TrimSpace(msg))
+		}
+		return fmt.Errorf("%s: %s", resp.Status, bytes.TrimSpace(msg))
 	}
 	if out != nil {
 		return json.NewDecoder(resp.Body).Decode(out)

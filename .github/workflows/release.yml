@@ -1,0 +1,44 @@
+name: Release
+
+# Pushing a tag like v0.1.0 builds static binaries and publishes a GitHub
+# release with the matching CHANGELOG section.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          # Build with the newest patched Go release. go.mod's "go 1.23" is
+          # only the minimum language version; an old toolchain ships known
+          # standard-library vulnerabilities (govulncheck fails on them).
+          go-version: stable
+          check-latest: true
+      - name: Tests must pass before release
+        run: go test -race -count=1 ./...
+      - name: Build binaries
+        run: |
+          mkdir dist
+          for arch in amd64 arm64; do
+            for cmd in mkube minictl; do
+              CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath \
+                -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
+                -o "dist/${cmd}-linux-${arch}" "./cmd/${cmd}"
+            done
+          done
+          (cd dist && sha256sum * > SHA256SUMS)
+      - name: Release notes from CHANGELOG
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '$0 ~ "^## \\[" v "\\]" {on=1; next} /^## \[/ {on=0} on' CHANGELOG.md > notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          files: dist/*

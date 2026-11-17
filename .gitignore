@@ -1,0 +1,4 @@
+bin/
+rootfs/
+coverage.out
+dist/

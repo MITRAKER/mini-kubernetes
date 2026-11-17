@@ -170,39 +170,19 @@ func (a *Agent) startWorker(p api.Pod) {
 
 // runPod runs one pod's container, restarting it according to its
 // RestartPolicy, until it finishes for good or ctx is cancelled.
+//
+// This loop has no fixed iteration bound by design: a service is restarted
+// for as long as it is wanted. It is bounded in time instead: every pass
+// waits at least BackoffBase, and cancelling ctx ends it (see JPL rule 2 in
+// LEARNING.md).
 func (a *Agent) runPod(ctx context.Context, p api.Pod) {
 	status := p.Status
 	backoff := a.BackoffBase
-	for {
-		cfg, logFile, err := a.containerConfig(p)
-		if err != nil {
-			a.report(ctx, p.Name, api.PodStatus{Phase: api.PodFailed, Reason: "InvalidSpec", Message: err.Error(), Restarts: status.Restarts})
+	for ctx.Err() == nil {
+		ran, ok := a.runOnce(ctx, p, &status)
+		if !ok || ctx.Err() != nil {
 			return
 		}
-
-		now := time.Now()
-		status.Phase, status.Reason, status.Message, status.Started = api.PodRunning, "", "", &now
-		a.report(ctx, p.Name, status)
-
-		res, err := a.Run(ctx, cfg, runtime.IO{Stdin: nil, Stdout: logFile, Stderr: logFile})
-		logFile.Close()
-		if ctx.Err() != nil {
-			return // pod deleted or agent shutting down
-		}
-		ran := time.Since(now)
-
-		status.ExitCode = res.ExitCode
-		switch {
-		case err != nil:
-			status.ExitCode, status.Reason, status.Message = 128, "StartError", err.Error()
-		case res.OOMKilled:
-			status.Reason = "OOMKilled"
-		case res.ExitCode == 0:
-			status.Reason = "Completed"
-		default:
-			status.Reason = "Error"
-		}
-
 		if !shouldRestart(p.Spec.RestartPolicy, status.ExitCode) {
 			status.Phase = api.PodSucceeded
 			if status.ExitCode != 0 {
@@ -211,7 +191,6 @@ func (a *Agent) runPod(ctx context.Context, p api.Pod) {
 			a.report(ctx, p.Name, status)
 			return
 		}
-
 		// A container that ran for a good while before exiting is not
 		// crash-looping, so start counting from the beginning again.
 		if ran > 2*a.BackoffMax {
@@ -223,13 +202,57 @@ func (a *Agent) runPod(ctx context.Context, p api.Pod) {
 			status.Reason = "CrashLoopBackOff"
 		}
 		a.report(ctx, p.Name, status)
-
-		select {
-		case <-ctx.Done():
+		if !sleep(ctx, backoff) {
 			return
-		case <-time.After(backoff):
 		}
 		backoff = min(backoff*2, a.BackoffMax)
+	}
+}
+
+// runOnce starts the pod's container once and records how it ended in
+// status. It returns how long the container ran, and false if the pod
+// cannot be run at all.
+func (a *Agent) runOnce(ctx context.Context, p api.Pod, status *api.PodStatus) (time.Duration, bool) {
+	cfg, logFile, err := a.containerConfig(p)
+	if err != nil {
+		a.report(ctx, p.Name, api.PodStatus{Phase: api.PodFailed, Reason: "InvalidSpec", Message: err.Error(), Restarts: status.Restarts})
+		return 0, false
+	}
+	start := time.Now()
+	status.Phase, status.Reason, status.Message, status.Started = api.PodRunning, "", "", &start
+	a.report(ctx, p.Name, *status)
+
+	res, runErr := a.Run(ctx, cfg, runtime.IO{Stdin: nil, Stdout: logFile, Stderr: logFile})
+	if err := logFile.Close(); err != nil {
+		log.Printf("agent %s: close log of %s: %v", a.Name, p.Name, err)
+	}
+	status.ExitCode, status.Reason, status.Message = exitStatus(res, runErr)
+	return time.Since(start), true
+}
+
+// exitStatus turns a runtime result into an exit code, reason and message.
+func exitStatus(res runtime.Result, err error) (code int, reason, message string) {
+	switch {
+	case err != nil:
+		return 128, "StartError", err.Error()
+	case res.OOMKilled:
+		return res.ExitCode, "OOMKilled", ""
+	case res.ExitCode == 0:
+		return 0, "Completed", ""
+	default:
+		return res.ExitCode, "Error", ""
+	}
+}
+
+// sleep waits for d, and returns false early if ctx is cancelled.
+func sleep(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }
 
@@ -252,10 +275,10 @@ func (a *Agent) containerConfig(p api.Pod) (*runtime.Config, *os.File, error) {
 	if _, err := os.Stat(rootfs); err != nil {
 		return nil, nil, fmt.Errorf("image %q not found on node %s", p.Spec.Image, a.Name)
 	}
-	if err := os.MkdirAll(a.LogDir, 0o755); err != nil {
+	if err := os.MkdirAll(a.LogDir, 0o750); err != nil {
 		return nil, nil, err
 	}
-	f, err := os.OpenFile(a.logPath(p.Name), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(a.logPath(p.Name), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -269,8 +292,7 @@ func (a *Agent) containerConfig(p api.Pod) (*runtime.Config, *os.File, error) {
 		MaxPids:     256,
 	}
 	if err := cfg.Validate(); err != nil {
-		f.Close()
-		return nil, nil, err
+		return nil, nil, errors.Join(err, f.Close())
 	}
 	return cfg, f, nil
 }
@@ -293,8 +315,9 @@ func (a *Agent) report(ctx context.Context, pod string, s api.PodStatus) {
 //	GET /logs/{pod}
 func (a *Agent) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, "ok\n")
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		// A failed write means the client went away; there is no one to tell.
+		_, _ = io.WriteString(w, "ok\n")
 	})
 	mux.HandleFunc("GET /logs/{pod}", func(w http.ResponseWriter, r *http.Request) {
 		pod := r.PathValue("pod")
@@ -302,14 +325,16 @@ func (a *Agent) Handler() http.Handler {
 			http.Error(w, "bad pod name", http.StatusBadRequest)
 			return
 		}
-		f, err := os.Open(a.logPath(pod))
+		f, err := os.Open(a.logPath(pod)) //nolint:gosec // G304: pod is a single path element, checked above
 		if err != nil {
 			http.Error(w, "no logs for pod "+pod, http.StatusNotFound)
 			return
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }() // read-only: close cannot lose data
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		io.Copy(w, f)
+		if _, err := io.Copy(w, f); err != nil {
+			log.Printf("agent %s: send logs of %s: %v", a.Name, pod, err)
+		}
 	})
 	return mux
 }

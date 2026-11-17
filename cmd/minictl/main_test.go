@@ -27,14 +27,14 @@ func startCluster(t *testing.T) string {
 	srv := httptest.NewServer((&apiserver.Server{Store: store}).Handler())
 	t.Cleanup(srv.Close)
 	ctx, cancel := context.WithCancel(context.Background())
-	api_ := client.New(srv.URL)
-	go (&scheduler.Scheduler{API: api_, Interval: 20 * time.Millisecond}).Run(ctx)
-	go (&controller.Manager{API: api_, Interval: 20 * time.Millisecond}).Run(ctx)
+	apiClient := client.New(srv.URL)
+	go (&scheduler.Scheduler{API: apiClient, Interval: 20 * time.Millisecond}).Run(ctx)
+	go (&controller.Manager{API: apiClient, Interval: 20 * time.Millisecond}).Run(ctx)
 
 	dir := t.TempDir()
 	os.MkdirAll(filepath.Join(dir, "images", "alpine"), 0o755)
 	a := &agent.Agent{
-		Name: "node1", API: api_, Capacity: api.Resources{MilliCPU: 4000, Memory: 4 << 30},
+		Name: "node1", API: apiClient, Capacity: api.Resources{MilliCPU: 4000, Memory: 4 << 30},
 		ImageDir: filepath.Join(dir, "images"), LogDir: filepath.Join(dir, "logs"),
 		SyncInterval: 20 * time.Millisecond,
 		Run: func(ctx context.Context, cfg *runtime.Config, io runtime.IO) (runtime.Result, error) {

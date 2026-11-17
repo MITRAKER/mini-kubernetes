@@ -31,10 +31,14 @@ Usage:
   minictl logs POD                          print a pod's output
   minictl scale deployment NAME REPLICAS    change the replica count
   minictl delete pod|deployment NAME
+  minictl version
 
 Global flags (before the command):
   -server URL   API server (default $MKUBE_SERVER or http://127.0.0.1:6443)
 `
+
+// version is set at build time by the release workflow (-ldflags -X).
+var version = "dev"
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -44,7 +48,8 @@ func main() {
 func run(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("minictl", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	fs.Usage = func() { fmt.Fprint(stderr, usage) }
+	errOut := &printer{w: stderr}
+	fs.Usage = func() { errOut.printf("%s", usage) }
 	def := os.Getenv("MKUBE_SERVER")
 	if def == "" {
 		def = "http://127.0.0.1:6443"
@@ -57,8 +62,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fs.Usage()
 		return 2
 	}
-	c := &cli{api: client.New(*server), out: stdout, ctx: context.Background()}
-	cmd, rest := fs.Arg(0), fs.Args()[1:]
+	c := &cli{api: client.New(*server), out: &printer{w: stdout}, ctx: context.Background()}
+	err := c.dispatch(fs.Arg(0), fs.Args()[1:])
+	if err == nil {
+		err = c.out.err
+	}
+	if err != nil {
+		errOut.printf("error: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func (c *cli) dispatch(cmd string, rest []string) error {
 	var err error
 	switch cmd {
 	case "apply":
@@ -72,21 +88,42 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "delete":
 		err = c.delete(rest)
 	case "help", "-h", "--help":
-		fmt.Fprint(stdout, usage)
+		c.out.printf("%s", usage)
+	case "version", "--version":
+		c.out.printf("minictl %s\n", version)
 	default:
 		err = fmt.Errorf("unknown command %q (run minictl help)", cmd)
 	}
-	if err != nil {
-		fmt.Fprintln(stderr, "error:", err)
-		return 1
-	}
-	return 0
+	return err
 }
 
 type cli struct {
 	api *client.Client
-	out io.Writer
+	out *printer
 	ctx context.Context
+}
+
+// printer is an io.Writer that remembers the first write error and skips
+// every write after it. Commands print freely, and run checks the error
+// once at the end, so no failed write goes unnoticed (JPL rule 7) without
+// an error check after every line.
+type printer struct {
+	w   io.Writer
+	err error
+}
+
+func (p *printer) Write(b []byte) (int, error) {
+	if p.err != nil {
+		return 0, p.err
+	}
+	n, err := p.w.Write(b)
+	p.err = err
+	return n, err
+}
+
+// printf formats to the printer. Its error is kept in p.err.
+func (p *printer) printf(format string, args ...any) {
+	_, _ = fmt.Fprintf(p, format, args...)
 }
 
 // kind accepts the same short names kubectl does.
@@ -109,15 +146,9 @@ func (c *cli) apply(args []string) error {
 		return err
 	}
 	if *file == "" {
-		return fmt.Errorf("apply needs -f FILE")
+		return errors.New("apply needs -f FILE")
 	}
-	var data []byte
-	var err error
-	if *file == "-" {
-		data, err = io.ReadAll(os.Stdin)
-	} else {
-		data, err = os.ReadFile(*file)
-	}
+	data, err := readInput(*file)
 	if err != nil {
 		return err
 	}
@@ -126,36 +157,53 @@ func (c *cli) apply(args []string) error {
 		return err
 	}
 	for _, o := range objs {
-		switch {
-		case o.Deployment != nil:
-			// apply is declarative: "make it look like this file". It
-			// overwrites whatever is there, so it sends no resourceVersion.
-			_, getErr := c.api.GetDeployment(c.ctx, o.Deployment.Name)
-			if _, err := c.api.ApplyDeployment(c.ctx, o.Deployment); err != nil {
-				return err
-			}
-			verb := "configured"
-			if errors.Is(getErr, client.ErrNotFound) {
-				verb = "created"
-			}
-			fmt.Fprintf(c.out, "deployment/%s %s\n", o.Deployment.Name, verb)
-		case o.Pod != nil:
-			if _, err := c.api.GetPod(c.ctx, o.Pod.Name); err == nil {
-				fmt.Fprintf(c.out, "pod/%s unchanged (pods can't be edited; delete it first, or use a Deployment)\n", o.Pod.Name)
-				continue
-			}
-			if err := c.api.CreatePod(c.ctx, o.Pod); err != nil {
-				return err
-			}
-			fmt.Fprintf(c.out, "pod/%s created\n", o.Pod.Name)
+		if err := c.applyObject(o); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
+func readInput(file string) ([]byte, error) {
+	if file == "-" {
+		return io.ReadAll(io.LimitReader(os.Stdin, maxManifestBytes))
+	}
+	return os.ReadFile(file) //nolint:gosec // G304: reading the file the user named is the point
+}
+
+// maxManifestBytes bounds how much input apply reads (JPL rule 3: bounded
+// resources).
+const maxManifestBytes = 10 << 20
+
+func (c *cli) applyObject(o manifest.Object) error {
+	if o.Deployment != nil {
+		// apply is declarative: "make it look like this file". It
+		// overwrites whatever is there, so it sends no resourceVersion.
+		_, getErr := c.api.GetDeployment(c.ctx, o.Deployment.Name)
+		if _, err := c.api.ApplyDeployment(c.ctx, o.Deployment); err != nil {
+			return err
+		}
+		verb := "configured"
+		if errors.Is(getErr, client.ErrNotFound) {
+			verb = "created"
+		}
+		c.out.printf("deployment/%s %s\n", o.Deployment.Name, verb)
+		return nil
+	}
+	if _, err := c.api.GetPod(c.ctx, o.Pod.Name); err == nil {
+		c.out.printf("pod/%s unchanged (pods can't be edited; delete it first, or use a Deployment)\n", o.Pod.Name)
+		return nil
+	}
+	if err := c.api.CreatePod(c.ctx, o.Pod); err != nil {
+		return err
+	}
+	c.out.printf("pod/%s created\n", o.Pod.Name)
+	return nil
+}
+
 func (c *cli) get(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("get needs a resource type: pods, nodes or deployments")
+		return errors.New("get needs a resource type: pods, nodes or deployments")
 	}
 	k, err := kind(args[0])
 	if err != nil {
@@ -166,16 +214,7 @@ func (c *cli) get(args []string) error {
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
-
-	var v any
-	switch k {
-	case "pod":
-		v, err = c.api.ListPods(c.ctx, "")
-	case "node":
-		v, err = c.api.ListNodes(c.ctx)
-	case "deployment":
-		v, err = c.api.ListDeployments(c.ctx)
-	}
+	v, err := c.list(k)
 	if err != nil {
 		return err
 	}
@@ -184,36 +223,51 @@ func (c *cli) get(args []string) error {
 		enc.SetIndent("", "  ")
 		return enc.Encode(v)
 	}
-
 	tw := tabwriter.NewWriter(c.out, 0, 0, 3, ' ', 0)
-	defer tw.Flush()
-	now := time.Now()
+	printTable(tw, v, time.Now())
+	return tw.Flush()
+}
+
+func (c *cli) list(k string) (any, error) {
+	switch k {
+	case "pod":
+		return c.api.ListPods(c.ctx, "")
+	case "node":
+		return c.api.ListNodes(c.ctx)
+	default:
+		return c.api.ListDeployments(c.ctx)
+	}
+}
+
+// printTable writes a kubectl-style table. Write errors are kept by the
+// underlying printer and reported by Flush.
+func printTable(w io.Writer, v any, now time.Time) {
+	row := func(format string, args ...any) { _, _ = fmt.Fprintf(w, format, args...) }
 	switch items := v.(type) {
 	case []api.Pod:
-		fmt.Fprintln(tw, "NAME\tSTATUS\tRESTARTS\tNODE\tAGE")
+		row("NAME\tSTATUS\tRESTARTS\tNODE\tAGE\n")
 		for _, p := range items {
 			node := p.NodeName
 			if node == "" {
 				node = "<none>"
 			}
-			fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\n", p.Name, podStatus(p), p.Status.Restarts, node, age(now, p.Created))
+			row("%s\t%s\t%d\t%s\t%s\n", p.Name, podStatus(p), p.Status.Restarts, node, age(now, p.Created))
 		}
 	case []api.Node:
-		fmt.Fprintln(tw, "NAME\tSTATUS\tCPU\tMEMORY\tLAST HEARTBEAT")
+		row("NAME\tSTATUS\tCPU\tMEMORY\tLAST HEARTBEAT\n")
 		for _, n := range items {
 			status := "Ready"
 			if !n.Ready {
 				status = "NotReady"
 			}
-			fmt.Fprintf(tw, "%s\t%s\t%dm\t%dMi\t%s ago\n", n.Name, status, n.Capacity.MilliCPU, n.Capacity.Memory>>20, age(now, n.LastHeartbeat))
+			row("%s\t%s\t%dm\t%dMi\t%s ago\n", n.Name, status, n.Capacity.MilliCPU, n.Capacity.Memory>>20, age(now, n.LastHeartbeat))
 		}
 	case []api.Deployment:
-		fmt.Fprintln(tw, "NAME\tREADY\tAGE")
+		row("NAME\tREADY\tAGE\n")
 		for _, d := range items {
-			fmt.Fprintf(tw, "%s\t%d/%d\t%s\n", d.Name, d.Status.ReadyReplicas, d.Replicas, age(now, d.Created))
+			row("%s\t%d/%d\t%s\n", d.Name, d.Status.ReadyReplicas, d.Replicas, age(now, d.Created))
 		}
 	}
-	return nil
 }
 
 // podStatus shows the most useful single word, like kubectl's STATUS column:
@@ -248,7 +302,7 @@ func age(now, t time.Time) string {
 // API server only tells us which node that is and where its agent listens.
 func (c *cli) logs(args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: minictl logs POD")
+		return errors.New("usage: minictl logs POD")
 	}
 	pod, err := c.api.GetPod(c.ctx, args[0])
 	if err != nil {
@@ -257,30 +311,40 @@ func (c *cli) logs(args []string) error {
 	if pod.NodeName == "" {
 		return fmt.Errorf("pod %s is not scheduled yet", pod.Name)
 	}
-	nodes, err := c.api.ListNodes(c.ctx)
+	addr, err := c.nodeAddress(pod.NodeName)
 	if err != nil {
 		return err
 	}
-	var addr string
-	for _, n := range nodes {
-		if n.Name == pod.NodeName {
-			addr = n.Address
-		}
+	ctx, cancel := context.WithTimeout(c.ctx, 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(addr, "/")+"/logs/"+url.PathEscape(pod.Name), nil)
+	if err != nil {
+		return err
 	}
-	if addr == "" {
-		return fmt.Errorf("node %s has no address", pod.NodeName)
-	}
-	resp, err := http.Get(strings.TrimRight(addr, "/") + "/logs/" + url.PathEscape(pod.Name))
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("reach node %s: %w", pod.NodeName, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }() // read-only: close cannot lose data
 	if resp.StatusCode != http.StatusOK {
-		msg, _ := io.ReadAll(resp.Body)
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096)) // best effort: only used in the error text
 		return fmt.Errorf("node %s: %s", pod.NodeName, strings.TrimSpace(string(msg)))
 	}
 	_, err = io.Copy(c.out, resp.Body)
 	return err
+}
+
+func (c *cli) nodeAddress(node string) (string, error) {
+	nodes, err := c.api.ListNodes(c.ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, n := range nodes {
+		if n.Name == node && n.Address != "" {
+			return n.Address, nil
+		}
+	}
+	return "", fmt.Errorf("node %s has no address", node)
 }
 
 // scale is a read-modify-write, so it uses optimistic concurrency: it sends
@@ -288,16 +352,17 @@ func (c *cli) logs(args []string) error {
 // deployment in between, the server answers 409 and we simply try again.
 func (c *cli) scale(args []string) error {
 	if len(args) != 3 {
-		return fmt.Errorf("usage: minictl scale deployment NAME REPLICAS")
+		return errors.New("usage: minictl scale deployment NAME REPLICAS")
 	}
 	if k, err := kind(args[0]); err != nil || k != "deployment" {
-		return fmt.Errorf("only deployments can be scaled")
+		return errors.New("only deployments can be scaled")
 	}
 	n, err := strconv.Atoi(args[2])
 	if err != nil || n < 0 {
-		return fmt.Errorf("replicas must be a number >= 0")
+		return errors.New("replicas must be a number >= 0")
 	}
-	for attempt := 0; attempt < 5; attempt++ {
+	const maxAttempts = 5 // bounded retry (JPL rule 2)
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		d, err := c.api.GetDeployment(c.ctx, args[1])
 		if err != nil {
 			return notFound(err, "deployment", args[1])
@@ -305,7 +370,7 @@ func (c *cli) scale(args []string) error {
 		d.Replicas = n
 		_, err = c.api.ApplyDeployment(c.ctx, d)
 		if err == nil {
-			fmt.Fprintf(c.out, "deployment/%s scaled to %d\n", d.Name, n)
+			c.out.printf("deployment/%s scaled to %d\n", d.Name, n)
 			return nil
 		}
 		if !errors.Is(err, client.ErrConflict) {
@@ -317,7 +382,7 @@ func (c *cli) scale(args []string) error {
 
 func (c *cli) delete(args []string) error {
 	if len(args) != 2 {
-		return fmt.Errorf("usage: minictl delete pod|deployment NAME")
+		return errors.New("usage: minictl delete pod|deployment NAME")
 	}
 	k, err := kind(args[0])
 	if err != nil {
@@ -329,12 +394,12 @@ func (c *cli) delete(args []string) error {
 	case "deployment":
 		err = c.api.DeleteDeployment(c.ctx, args[1])
 	default:
-		return fmt.Errorf("nodes can't be deleted; stop their agent instead")
+		return errors.New("nodes can't be deleted; stop their agent instead")
 	}
 	if err != nil {
 		return notFound(err, k, args[1])
 	}
-	fmt.Fprintf(c.out, "%s/%s deleted\n", k, args[1])
+	c.out.printf("%s/%s deleted\n", k, args[1])
 	return nil
 }
 

@@ -32,7 +32,7 @@ func newFakeAPI() *fakeAPI {
 
 func (f *fakeAPI) handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("PUT /api/nodes/{name}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("PUT /api/nodes/{name}", func(_ http.ResponseWriter, r *http.Request) {
 		var n api.Node
 		json.NewDecoder(r.Body).Decode(&n)
 		f.mu.Lock()

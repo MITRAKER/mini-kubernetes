@@ -35,7 +35,7 @@ func TestMain(m *testing.M) {
 }
 
 // fakeRun pretends to start a container that runs until it is stopped.
-func fakeRun(ctx context.Context, cfg *runtime.Config, stdio runtime.IO) (runtime.Result, error) {
+func fakeRun(ctx context.Context, _ *runtime.Config, _ runtime.IO) (runtime.Result, error) {
 	<-ctx.Done()
 	return runtime.Result{ExitCode: 137}, nil
 }

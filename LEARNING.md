@@ -9,6 +9,7 @@ exercise so you can rebuild or extend it yourself.
 - [Chapter 3: The control plane](#chapter-3-the-control-plane)
 - [Chapter 4: minictl, a small kubectl](#chapter-4-minictl-a-small-kubectl)
 - [Chapter 5: Demo, CI, and presenting the project](#chapter-5-demo-ci-and-presenting-the-project)
+- [Chapter 6: Professional quality and the NASA/JPL rules](#chapter-6-professional-quality-and-the-nasajpl-rules)
 
 ---
 
@@ -829,3 +830,113 @@ learning from a failure.
    rootfs.tar.gz` that unpacks a tarball into every node's image directory.
 3. Add pod networking: create a bridge `mkube0`, give each container a
    `veth` pair and an IP, and let pods on one node reach each other.
+
+---
+
+## Chapter 6: Professional quality and the NASA/JPL rules
+
+**Files:** `.golangci.yml`, `.github/`, `CONTRIBUTING.md`, `Makefile`,
+`.pre-commit-config.yaml`, `scripts/check-coverage.sh`
+
+### What the "Power of Ten" is
+
+In 2006 Gerard Holzmann at NASA's Jet Propulsion Laboratory wrote ten rules
+for safety-critical C code, the kind that flies on Mars rovers. The idea: a
+small set of rules that a tool can check automatically is worth more than a
+thick style guide nobody reads. The rules are for C, so each one has to be
+translated into Go. This table is the translation used in this project, and
+how each rule is enforced:
+
+| # | JPL rule (for C) | What it means in this Go code | Enforced by |
+|---|---|---|---|
+| 1 | Simple control flow: no `goto`, no recursion | No recursion anywhere; complexity limits keep functions shallow | `gocyclo` ≤ 12, `gocognit` ≤ 20, `nestif` |
+| 2 | Every loop has a fixed upper bound | Retry loops have a constant cap (`maxAttempts = 5`); service loops are bounded in *time*: they wait between passes and stop when their `context` is cancelled | Code review, comments at each loop |
+| 3 | No dynamic memory after start-up | Go has a garbage collector, so the spirit is "bounded resources": request bodies capped at 1 MB (`MaxBytesReader`), manifest input at 10 MB, error bodies at 4 KB, and every network wait has a timeout | `gosec` (G112 Slowloris), `noctx` |
+| 4 | A function fits on one printed page (~60 lines) | At most 60 lines and 40 statements | `funlen` |
+| 5 | At least two assertions per function | Go has no `assert`; public entry points check their preconditions and return errors (`Validate`, `if cfg == nil`), and tests check invariants | Code review, tests |
+| 6 | Declare data in the smallest scope | `if err := ...; err != nil`, no package-level mutable state except test hooks | `ineffassign`, `wastedassign`, `unused` |
+| 7 | Check every return value; cast to `void` if ignored | Every error is checked. Ignoring one is written `_ = f.Close()` with a comment saying why it is safe | `errcheck`, `errorlint`, `bodyclose` |
+| 8 | Limit the preprocessor | Go has no macros; the project uses no code generation and no build tags | (by construction) |
+| 9 | Restrict pointers; no function pointers | The one use of `unsafe` (an `ioctl` in `rootfs.go`) is isolated and audited. Function values are used only for dependency injection | `gosec` G103 |
+| 10 | Compile with all warnings on, zero warnings, use static analysers daily | `go vet` with all analysers, `staticcheck`, `revive`; CI fails on any finding | `golangci-lint` in CI and pre-commit |
+
+### What applying the rules changed
+
+Turning the linters on found **80 issues** in code that already passed all
+its tests. Fixing them was not just cosmetic:
+
+- **41 unchecked errors (rule 7).** Most were harmless (`Close` on a file only
+  read from), but some were not: if the deferred `cgroup.Remove()` failed, the
+  cgroup leaked silently, and a failed status update in the controller was
+  ignored. Now each one is either handled or explicitly ignored with a reason.
+- **`runtime.Run` and the agent's `runPod` were too long (rule 4).** Splitting
+  them produced named steps (`initCommand`, `handshake`, `waitResult`,
+  `runOnce`, `exitStatus`) that read like the explanation in chapter 1.
+- **The deployment controller was the most complex function (rule 1).** It
+  was split into `planDeployment`, a **pure function** that only decides what
+  to do, and a small executor that does it. A pure function can be tested
+  with plain data, so `plan_test.go` now checks eight rollout cases, including
+  "a crashing new version stalls the rollout", without any HTTP or containers.
+- **HTTP servers had no timeouts (rule 3).** A client that opens a connection
+  and sends headers one byte a minute (a "Slowloris" attack) could exhaust
+  the server. Every server now has read and idle timeouts, and every outgoing
+  request carries a context with a deadline.
+- **Files were created world-readable.** Logs and the state file are now
+  `0600`, directories `0750`. The three exceptions (`/proc`, `/tmp`, `/dev`
+  inside a container must be world-accessible) carry a `//nolint:gosec`
+  comment explaining why.
+- **The CLI's output errors.** Checking the error of every `fmt.Fprintf` would
+  bury the logic. Instead `minictl` writes through a small `printer` that
+  remembers the first error and skips later writes, and `run` checks it once.
+  This "sticky error" pattern comes from Rob Pike's essay *Errors are values*.
+
+### The tooling, and why each piece exists
+
+| Tool | What it catches | When it runs |
+|---|---|---|
+| **golangci-lint** | 19 linters in one fast pass (the JPL table above) | pre-commit, CI `lint` job |
+| **`go test -race`** | Data races between goroutines | CI `unit` job |
+| **Integration tests as root** | Bugs only real namespaces and cgroups reveal (remember `.oldroot`) | CI `integration` job |
+| **Coverage gate** | Untested code creeping in. The threshold is 65% because about a third of the code needs a real multi-machine setup or failure injection to reach | CI `integration` job |
+| **govulncheck** | Known CVEs in dependencies *and the Go standard library*, only if your code actually calls the vulnerable function | CI `security` job |
+| **CodeQL** | Deeper security flaws (injection, path traversal) by analysing data flow | Every PR and weekly |
+| **Dependabot** | Outdated dependencies and GitHub Actions | Weekly pull requests |
+| **pre-commit** | All of the above that is fast, before code even leaves your machine | Every `git commit` |
+
+The CI jobs run in parallel where they can, and the slow root job only starts
+once lint and unit tests pass (`needs: [lint, unit]`), so feedback on a typo
+arrives in a minute, not five. `concurrency: cancel-in-progress` cancels the
+old run when you push again to the same branch.
+
+### The rest of a professional repository
+
+- **LICENSE** (MIT): without one, nobody may legally use your code.
+- **CONTRIBUTING.md**: how to set up, the coding standard, how to send a PR.
+- **SECURITY.md**: how to report a vulnerability privately.
+- **CHANGELOG.md** in the *Keep a Changelog* format, and **Semantic
+  Versioning**: `MAJOR.MINOR.PATCH`, where MAJOR changes break users.
+- **Release workflow**: pushing a tag like `v0.1.0` runs the tests, builds
+  static Linux binaries for amd64 and arm64 with SHA-256 checksums, and
+  publishes a GitHub release with the matching CHANGELOG section as notes.
+- **Issue and PR templates** so reports arrive with the information needed,
+  and a **CODEOWNERS** file so reviews are requested automatically.
+- **Badges** in the README: a reviewer sees at a glance that CI is green.
+
+### Exercises
+
+1. Lower `funlen` to 40 lines and refactor what breaks. Does the code read
+   better or worse? Where is the sweet spot?
+2. Add `gomodguard` to forbid any new dependency without a review.
+3. Turn on branch protection on GitHub: require the CI checks to pass and one
+   review before merging to `main`.
+4. Add fuzz testing (`go test -fuzz`) for `manifest.Parse` and `ParseMemory`:
+   both take untrusted input.
+
+### Interview questions this chapter prepares you for
+
+- What is static analysis, and what can it catch that tests can't?
+- How do you keep a codebase consistent across many contributors?
+- Why might you set a coverage threshold below 100%?
+- What is a supply-chain attack, and what in this repo defends against it?
+  (Pinned tool versions, Dependabot, govulncheck, CodeQL, least-privilege
+  `permissions:` in every workflow.)

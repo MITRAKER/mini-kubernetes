@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"net"
@@ -23,25 +24,34 @@ import (
 // bundles them like this. They still talk to each other only through the
 // HTTP API, so splitting them later would need no code changes.
 func runServer(args []string) int {
-	fs := flag.NewFlagSet("server", flag.ExitOnError)
+	fs := flag.NewFlagSet("server", flag.ContinueOnError)
 	listen := fs.String("listen", ":6443", "address for the API server")
 	data := fs.String("data", "/var/lib/mkube/state.json", `cluster state file ("" keeps state in memory only)`)
 	nodeTimeout := fs.Duration("node-timeout", 10*time.Second, "how long a node may miss heartbeats before its pods are moved")
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
 
 	store, err := apiserver.NewStore(*data)
 	if err != nil {
-		log.Fatal(err)
+		log.Print(err)
+		return 1
 	}
-	ln, err := net.Listen("tcp", *listen)
-	if err != nil {
-		log.Fatal(err)
-	}
-	srv := &http.Server{Handler: (&apiserver.Server{Store: store}).Handler()}
-	go srv.Serve(ln)
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", *listen)
+	if err != nil {
+		log.Print(err)
+		return 1
+	}
+	srv := newHTTPServer("", (&apiserver.Server{Store: store}).Handler())
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("api server: %v", err)
+			stop()
+		}
+	}()
 
 	self := client.New("http://" + loopback(ln.Addr()))
 	go (&scheduler.Scheduler{API: self}).Run(ctx)
@@ -49,7 +59,10 @@ func runServer(args []string) int {
 
 	log.Printf("control plane listening on %s (state: %s)", ln.Addr(), *data)
 	<-ctx.Done()
-	srv.Shutdown(context.Background())
+	if err := shutdown(srv); err != nil {
+		log.Printf("api server shutdown: %v", err)
+		return 1
+	}
 	return 0
 }
 

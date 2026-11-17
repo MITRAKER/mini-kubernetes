@@ -15,6 +15,8 @@ package controller
 import (
 	"context"
 	"crypto/rand"
+	"errors"
+	"fmt"
 	"log"
 	"reflect"
 	"sort"
@@ -80,38 +82,59 @@ func (m *Manager) reconcileNodes(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	dead, err := m.markDeadNodes(ctx, nodes)
+	if err != nil || len(dead) == 0 {
+		return err
+	}
+	return m.evictPods(ctx, dead)
+}
+
+// markDeadNodes marks nodes whose heartbeat is older than NodeTimeout as
+// NotReady and returns the names of all such nodes.
+func (m *Manager) markDeadNodes(ctx context.Context, nodes []api.Node) (map[string]bool, error) {
 	dead := map[string]bool{}
 	for _, n := range nodes {
 		if m.Now().Sub(n.LastHeartbeat) <= m.NodeTimeout {
 			continue
 		}
 		dead[n.Name] = true
-		if n.Ready {
-			log.Printf("node controller: node %s missed heartbeats for %s, marking NotReady", n.Name, m.NodeTimeout)
-			n.Ready = false
-			if err := m.API.PutNode(ctx, &n); err != nil {
-				return err
-			}
+		if !n.Ready {
+			continue
+		}
+		log.Printf("node controller: node %s missed heartbeats for %s, marking NotReady", n.Name, m.NodeTimeout)
+		n.Ready = false
+		if err := m.API.PutNode(ctx, &n); err != nil {
+			return nil, err
 		}
 	}
-	if len(dead) == 0 {
-		return nil
-	}
-	// Evict: delete every still-running pod on a dead node. Pods owned by a
-	// Deployment are recreated by the deployment controller and scheduled
-	// onto a healthy node. A bare pod with no owner is simply gone, which
-	// is why you should almost never create bare pods in Kubernetes.
+	return dead, nil
+}
+
+// evictPods deletes every still-running pod on a dead node. Pods owned by a
+// Deployment are recreated by the deployment controller and scheduled onto
+// a healthy node. A bare pod with no owner is simply gone, which is why you
+// should almost never create bare pods in Kubernetes.
+func (m *Manager) evictPods(ctx context.Context, dead map[string]bool) error {
 	pods, err := m.API.ListPods(ctx, "")
 	if err != nil {
 		return err
 	}
 	for _, p := range pods {
 		if dead[p.NodeName] && !p.Terminated() {
-			log.Printf("node controller: evicting pod %s from dead node %s", p.Name, p.NodeName)
-			if err := m.API.DeletePod(ctx, p.Name); err != nil && err != client.ErrNotFound {
+			if err := m.deletePod(ctx, p.Name, "node controller: evicting pod from dead node "+p.NodeName); err != nil {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+// deletePod deletes a pod and logs why. A pod that is already gone is fine:
+// someone else reached the same conclusion first.
+func (m *Manager) deletePod(ctx context.Context, name, why string) error {
+	log.Printf("%s: deleting pod %s", why, name)
+	if err := m.API.DeletePod(ctx, name); err != nil && !errors.Is(err, client.ErrNotFound) {
+		return err
 	}
 	return nil
 }
@@ -127,25 +150,12 @@ func (m *Manager) reconcileDeployments(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	owned := map[string][]api.Pod{}
-	exists := map[string]bool{}
-	for _, d := range deps {
-		exists[d.Name] = true
-	}
-	for _, p := range pods {
-		owner := p.Labels[api.DeploymentLabel]
-		if owner == "" {
-			continue
+	owned, orphans := groupByOwner(deps, pods)
+	for _, name := range orphans {
+		// Garbage collection: the Deployment was deleted, so its pods go too.
+		if err := m.deletePod(ctx, name, "deployment controller: orphan"); err != nil {
+			return err
 		}
-		if !exists[owner] {
-			// Garbage collection: the Deployment was deleted, so its pods go too.
-			log.Printf("deployment controller: deleting orphan pod %s", p.Name)
-			if err := m.API.DeletePod(ctx, p.Name); err != nil && err != client.ErrNotFound {
-				return err
-			}
-			continue
-		}
-		owned[owner] = append(owned[owner], p)
 	}
 	for _, d := range deps {
 		if err := m.reconcileDeployment(ctx, d, owned[d.Name]); err != nil {
@@ -155,47 +165,54 @@ func (m *Manager) reconcileDeployments(ctx context.Context) error {
 	return nil
 }
 
-// reconcileDeployment takes at most one kind of step per pass. Small steps
-// are easier to reason about, and the next pass sees their result.
-func (m *Manager) reconcileDeployment(ctx context.Context, d api.Deployment, pods []api.Pod) error {
-	// 1. Pods that finished for good (for example OOMKilled with
-	//    restartPolicy Never) are replaced, not kept.
-	var alive, current, old []api.Pod
+// groupByOwner sorts pods by the Deployment that owns them, and lists pods
+// whose owner no longer exists.
+func groupByOwner(deps []api.Deployment, pods []api.Pod) (map[string][]api.Pod, []string) {
+	owned := map[string][]api.Pod{}
+	for _, d := range deps {
+		owned[d.Name] = nil
+	}
+	var orphans []string
 	for _, p := range pods {
-		if p.Terminated() {
-			log.Printf("deployment controller: %s: replacing finished pod %s (%s)", d.Name, p.Name, p.Status.Reason)
-			if err := m.API.DeletePod(ctx, p.Name); err != nil && err != client.ErrNotFound {
-				return err
-			}
+		owner := p.Labels[api.DeploymentLabel]
+		if owner == "" {
 			continue
 		}
-		alive = append(alive, p)
-		if reflect.DeepEqual(p.Spec, d.Template) {
-			current = append(current, p)
-		} else {
-			old = append(old, p)
+		if _, ok := owned[owner]; !ok {
+			orphans = append(orphans, p.Name)
+			continue
+		}
+		owned[owner] = append(owned[owner], p)
+	}
+	return owned, orphans
+}
+
+// plan is what the deployment controller decided to do in one pass.
+type plan struct {
+	status api.DeploymentStatus
+	create int      // new pods to create from the template
+	delete []string // pods to delete
+	why    string   // log message explaining the deletions
+}
+
+// reconcileDeployment computes a plan and carries it out.
+func (m *Manager) reconcileDeployment(ctx context.Context, d api.Deployment, pods []api.Pod) error {
+	pl := planDeployment(d, pods)
+	if err := m.API.UpdateDeploymentStatus(ctx, d.Name, pl.status); err != nil {
+		return fmt.Errorf("update status: %w", err)
+	}
+	for _, name := range pl.delete {
+		if err := m.deletePod(ctx, name, "deployment controller: "+d.Name+": "+pl.why); err != nil {
+			return err
 		}
 	}
-
-	ready := 0
-	for _, p := range alive {
-		if isReady(p) {
-			ready++
+	for i := 0; i < pl.create; i++ { // bounded: create <= d.Replicas
+		suffix, err := randomSuffix()
+		if err != nil {
+			return err
 		}
-	}
-	defer m.API.UpdateDeploymentStatus(ctx, d.Name, api.DeploymentStatus{Replicas: len(alive), ReadyReplicas: ready})
-
-	// 2. Create missing pods from the current template. During a rollout we
-	//    allow one extra pod ("maxSurge 1"), so a new pod can start before
-	//    an old one is removed.
-	maxTotal := d.Replicas
-	if len(old) > 0 {
-		maxTotal++
-	}
-	toCreate := min(d.Replicas-len(current), maxTotal-len(alive))
-	for i := 0; i < toCreate; i++ {
 		p := api.Pod{
-			Name:   d.Name + "-" + randomSuffix(),
+			Name:   d.Name + "-" + suffix,
 			Labels: map[string]string{api.DeploymentLabel: d.Name},
 			Spec:   d.Template,
 		}
@@ -204,37 +221,87 @@ func (m *Manager) reconcileDeployment(ctx context.Context, d api.Deployment, pod
 			return err
 		}
 	}
-	if toCreate > 0 {
-		return nil
-	}
+	return nil
+}
 
+// podSets splits a Deployment's pods by state.
+type podSets struct {
+	finished, alive, current, old []api.Pod
+	ready                         int
+}
+
+func classify(d api.Deployment, pods []api.Pod) podSets {
+	var s podSets
+	for _, p := range pods {
+		switch {
+		case p.Terminated():
+			s.finished = append(s.finished, p)
+			continue
+		case reflect.DeepEqual(p.Spec, d.Template):
+			s.current = append(s.current, p)
+		default:
+			s.old = append(s.old, p)
+		}
+		s.alive = append(s.alive, p)
+		if isReady(p) {
+			s.ready++
+		}
+	}
+	return s
+}
+
+// planDeployment decides the next step for a Deployment. It is a pure
+// function of its inputs, which makes the controller's logic easy to test.
+// It takes at most one kind of step per pass; the next pass sees the result.
+func planDeployment(d api.Deployment, pods []api.Pod) plan {
+	s := classify(d, pods)
+	pl := plan{status: api.DeploymentStatus{Replicas: len(s.alive), ReadyReplicas: s.ready}}
+
+	// 1. Pods that finished for good (for example OOMKilled with
+	//    restartPolicy Never) are replaced, not kept.
+	if len(s.finished) > 0 {
+		pl.delete, pl.why = names(s.finished), "replacing finished pod"
+		return pl
+	}
+	// 2. Create missing pods from the current template. During a rollout
+	//    one extra pod is allowed ("maxSurge 1"), so a new pod can start
+	//    before an old one is removed.
+	maxTotal := d.Replicas
+	if len(s.old) > 0 {
+		maxTotal++
+	}
+	if pl.create = min(d.Replicas-len(s.current), maxTotal-len(s.alive)); pl.create > 0 {
+		return pl
+	}
+	pl.create = 0
 	// 3. Rolling update: remove one old pod, but only if we stay at full
 	//    strength afterwards ("maxUnavailable 0"). If the new pods never
 	//    become ready, for example because the new version crashes, the
-	//    rollout simply stops here and the old pods keep serving.
-	if len(old) > 0 {
-		victim := byVictimOrder(old)[0]
+	//    rollout stops here and the old pods keep serving.
+	if len(s.old) > 0 {
+		victim := byVictimOrder(s.old)[0]
 		lost := 0
 		if isReady(victim) {
 			lost = 1
 		}
-		if ready-lost >= d.Replicas || len(alive) > d.Replicas+1 {
-			log.Printf("deployment controller: %s: rolling update, deleting old pod %s", d.Name, victim.Name)
-			return m.API.DeletePod(ctx, victim.Name)
+		if s.ready-lost >= d.Replicas || len(s.alive) > d.Replicas+1 {
+			pl.delete, pl.why = []string{victim.Name}, "rolling update"
 		}
-		return nil
+		return pl
 	}
-
 	// 4. Scale down: delete extras, the least useful first.
-	if extra := len(current) - d.Replicas; extra > 0 {
-		for _, victim := range byVictimOrder(current)[:extra] {
-			log.Printf("deployment controller: %s: scaling down, deleting pod %s", d.Name, victim.Name)
-			if err := m.API.DeletePod(ctx, victim.Name); err != nil && err != client.ErrNotFound {
-				return err
-			}
-		}
+	if extra := len(s.current) - d.Replicas; extra > 0 {
+		pl.delete, pl.why = names(byVictimOrder(s.current)[:extra]), "scaling down"
 	}
-	return nil
+	return pl
+}
+
+func names(pods []api.Pod) []string {
+	out := make([]string, len(pods))
+	for i, p := range pods {
+		out[i] = p.Name
+	}
+	return out
 }
 
 func isReady(p api.Pod) bool {
@@ -264,12 +331,16 @@ func byVictimOrder(pods []api.Pod) []api.Pod {
 	return sorted
 }
 
-func randomSuffix() string {
-	const letters = "bcdfghjklmnpqrstvwxz2456789" // no vowels: avoids accidental words, like Kubernetes
+// randomSuffix returns 5 random characters for a pod name. It leaves out
+// vowels, as Kubernetes does, so a name never spells an accidental word.
+func randomSuffix() (string, error) {
+	const letters = "bcdfghjklmnpqrstvwxz2456789"
 	b := make([]byte, 5)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("random pod name: %w", err)
+	}
 	for i := range b {
 		b[i] = letters[int(b[i])%len(letters)]
 	}
-	return string(b)
+	return string(b), nil
 }

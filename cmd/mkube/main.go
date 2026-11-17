@@ -14,6 +14,9 @@ import (
 	"github.com/MITRAKER/mini-kubernetes/internal/runtime"
 )
 
+// version is set at build time by the release workflow (-ldflags -X).
+var version = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -33,6 +36,8 @@ func main() {
 		os.Exit(runAgent(os.Args[2:]))
 	case "server":
 		os.Exit(runServer(os.Args[2:]))
+	case "version", "--version":
+		fmt.Println("mkube", version)
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -55,7 +60,7 @@ Run "mkube <command> -h" for the flags.
 }
 
 func run(args []string) int {
-	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	id := fs.String("name", "", "container name (required)")
 	rootfs := fs.String("rootfs", "", "directory with the container's filesystem (required)")
 	hostname := fs.String("hostname", "", "hostname inside the container (default: the name)")
@@ -65,7 +70,9 @@ func run(args []string) int {
 	network := fs.Bool("net", false, "give the container its own empty network (loopback only)")
 	var env multiFlag
 	fs.Var(&env, "env", "environment variable KEY=VALUE (repeatable)")
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
 
 	mem, err := runtime.ParseMemory(*memory)
 	if err != nil {

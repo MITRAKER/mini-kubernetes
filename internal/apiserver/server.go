@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"regexp"
 
@@ -25,10 +26,12 @@ var validName = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
 // Handler returns the HTTP routes.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok\n")) })
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok\n")) // a failed write means the client left; no one to tell
+	})
 
 	mux.HandleFunc("PUT /api/nodes/{name}", s.putNode)
-	mux.HandleFunc("GET /api/nodes", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, s.Store.ListNodes()) })
+	mux.HandleFunc("GET /api/nodes", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, s.Store.ListNodes()) })
 
 	mux.HandleFunc("POST /api/pods", s.createPod)
 	mux.HandleFunc("GET /api/pods", func(w http.ResponseWriter, r *http.Request) {
@@ -45,7 +48,7 @@ func (s *Server) Handler() http.Handler {
 	})
 
 	mux.HandleFunc("PUT /api/deployments/{name}", s.applyDeployment)
-	mux.HandleFunc("GET /api/deployments", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, s.Store.ListDeployments()) })
+	mux.HandleFunc("GET /api/deployments", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, s.Store.ListDeployments()) })
 	mux.HandleFunc("GET /api/deployments/{name}", func(w http.ResponseWriter, r *http.Request) {
 		d, err := s.Store.GetDeployment(r.PathValue("name"))
 		respond(w, d, err)
@@ -170,7 +173,10 @@ func readJSON(w http.ResponseWriter, r *http.Request, v any) bool {
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		// Headers are already sent, so the status can't change; record it.
+		log.Printf("apiserver: write response: %v", err)
+	}
 }
 
 // respond maps store errors to HTTP status codes, like the real API server:

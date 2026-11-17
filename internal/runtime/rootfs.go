@@ -50,7 +50,7 @@ func setupRootFS(rootfs string) error {
 
 	// /proc lists processes. Because we are in a new PID namespace, a
 	// fresh procfs only shows the container's own processes.
-	if err := os.MkdirAll("/proc", 0o555); err != nil {
+	if err := os.MkdirAll("/proc", 0o555); err != nil { //nolint:gosec // G301: /proc must be world-readable
 		return err
 	}
 	if err := syscall.Mount("proc", "/proc", "proc", syscall.MS_NOSUID|syscall.MS_NOEXEC|syscall.MS_NODEV, ""); err != nil {
@@ -59,7 +59,7 @@ func setupRootFS(rootfs string) error {
 	if err := setupDev(); err != nil {
 		return err
 	}
-	if err := os.MkdirAll("/tmp", 0o1777); err != nil {
+	if err := os.MkdirAll("/tmp", 0o1777); err != nil { //nolint:gosec // G301: /tmp is world-writable with the sticky bit by design
 		return err
 	}
 	if err := syscall.Mount("tmpfs", "/tmp", "tmpfs", syscall.MS_NOSUID|syscall.MS_NODEV, "mode=1777"); err != nil {
@@ -72,7 +72,7 @@ func setupRootFS(rootfs string) error {
 // setupDev mounts a fresh, minimal /dev instead of exposing the host's
 // devices (disks, GPUs and so on).
 func setupDev() error {
-	if err := os.MkdirAll("/dev", 0o755); err != nil {
+	if err := os.MkdirAll("/dev", 0o755); err != nil { //nolint:gosec // G301: programs must be able to open /dev/null
 		return err
 	}
 	if err := syscall.Mount("tmpfs", "/dev", "tmpfs", syscall.MS_NOSUID|syscall.MS_STRICTATIME, "mode=755,size=65536k"); err != nil {
@@ -112,7 +112,7 @@ func loopbackUp() error {
 	if err != nil {
 		return err
 	}
-	defer syscall.Close(fd)
+	defer func() { _ = syscall.Close(fd) }() // read-only use of the socket; close cannot lose data
 
 	// struct ifreq: a 16-byte interface name followed by a union, of which
 	// we use the 16-bit flags field.
@@ -122,11 +122,13 @@ func loopbackUp() error {
 		_     [22]byte
 	}
 	copy(ifr.name[:], "lo")
-	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), syscall.SIOCGIFFLAGS, uintptr(unsafe.Pointer(&ifr))); e != 0 {
+	// The only unsafe code in the project (JPL rule 9): ioctl takes a raw
+	// pointer to an ifreq struct, and ifr lives for the whole call.
+	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), syscall.SIOCGIFFLAGS, uintptr(unsafe.Pointer(&ifr))); e != 0 { //nolint:gosec // G103: audited, see above
 		return e
 	}
 	ifr.flags |= syscall.IFF_UP
-	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), syscall.SIOCSIFFLAGS, uintptr(unsafe.Pointer(&ifr))); e != 0 {
+	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), syscall.SIOCSIFFLAGS, uintptr(unsafe.Pointer(&ifr))); e != 0 { //nolint:gosec // G103: audited, see above
 		return e
 	}
 	return nil

@@ -28,6 +28,7 @@ type Resources struct {
 // RestartPolicy says what the node agent does when a pod's process exits.
 type RestartPolicy string
 
+// The restart policies.
 const (
 	RestartAlways    RestartPolicy = "Always"    // restart whatever the exit code (long-running services)
 	RestartOnFailure RestartPolicy = "OnFailure" // restart only on non-zero exit (batch jobs)
@@ -47,6 +48,7 @@ type PodSpec struct {
 // PodPhase is the high-level state of a pod.
 type PodPhase string
 
+// The pod phases.
 const (
 	PodPending   PodPhase = "Pending"   // accepted, not running yet
 	PodRunning   PodPhase = "Running"   // the process is running

@@ -1,5 +1,12 @@
 # Mini Kubernetes
 
+[![CI](https://github.com/MITRAKER/mini-kubernetes/actions/workflows/ci.yml/badge.svg)](https://github.com/MITRAKER/mini-kubernetes/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/MITRAKER/mini-kubernetes/actions/workflows/codeql.yml/badge.svg)](https://github.com/MITRAKER/mini-kubernetes/actions/workflows/codeql.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/MITRAKER/mini-kubernetes)](https://goreportcard.com/report/github.com/MITRAKER/mini-kubernetes)
+[![Go version](https://img.shields.io/github/go-mod/go-version/MITRAKER/mini-kubernetes)](go.mod)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Coding standard: NASA/JPL Power of Ten](https://img.shields.io/badge/coding%20standard-JPL%20Power%20of%20Ten-orange)](CONTRIBUTING.md#coding-standard)
+
 A small container orchestrator written from scratch in Go, to learn how Linux
 containers and Kubernetes really work. Every layer is built on raw Linux
 primitives (namespaces, cgroups, `pivot_root`), with no Docker or containerd
@@ -65,7 +72,7 @@ died; it just stops seeing that node as Ready.
 
 ## Demo
 
-Needs Linux, Go 1.22+ and root. One command starts a 3-node cluster on your
+Needs Linux, Go 1.23+ and root. One command starts a 3-node cluster on your
 machine and walks through scheduling, a node failure, scaling and an OOM kill:
 
 ```bash
@@ -135,12 +142,22 @@ template:
 
 More in [`examples/`](examples).
 
-## Tests
+## Tests and quality
 
 ```bash
-make test                     # unit tests with the race detector, no root
+make check                    # lint (JPL rules), unit tests, tidy modules
 sudo make test-integration    # real containers, including a full cluster
+sudo make cover               # coverage report, fails below 65%
+make vuln                     # known vulnerabilities in dependencies
 ```
+
+Every pull request runs: **golangci-lint** with 19 linters configured for the
+NASA/JPL "Power of Ten" rules (zero findings allowed), **race-detector unit
+tests**, **integration tests as root** with real namespaces and cgroups,
+a **coverage gate**, **govulncheck** and **CodeQL**. Dependabot keeps
+dependencies current, pre-commit hooks run the same checks locally, and
+pushing a `v*` tag publishes a release with Linux binaries.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the coding standard.
 
 `test/e2e` runs a whole cluster in one test process (API server, scheduler,
 controllers and two agents over real HTTP) and checks scheduling, scaling,
@@ -162,7 +179,8 @@ internal/client/      API server HTTP client
 internal/manifest/    YAML manifests
 test/e2e/             a whole cluster inside one test
 examples/             ready-to-apply manifests
-scripts/              rootfs builder and demo
+scripts/              rootfs builder, demo, coverage gate
+.github/              CI, CodeQL, release, Dependabot, templates
 LEARNING.md           how and why, chapter by chapter
 ```
 
@@ -173,3 +191,7 @@ networking between nodes (pods use the host network or an isolated loopback),
 no authentication on the API, no image pulling (images are directories on
 each node), and all components poll instead of using watches.
 [LEARNING.md](LEARNING.md) suggests how to add each of these as an exercise.
+
+## License
+
+[MIT](LICENSE)

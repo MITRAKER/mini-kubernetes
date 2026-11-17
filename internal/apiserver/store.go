@@ -51,7 +51,7 @@ func NewStore(path string) (*Store, error) {
 	if path == "" {
 		return s, nil
 	}
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) //nolint:gosec // G304: the state file path is the operator's own flag
 	if errors.Is(err, os.ErrNotExist) {
 		return s, nil
 	}
@@ -75,11 +75,11 @@ func (s *Store) save() error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(s.path), 0o750); err != nil {
 		return err
 	}
 	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	if err := os.WriteFile(tmp, b, 0o600); err != nil { // cluster state is private to root
 		return err
 	}
 	return os.Rename(tmp, s.path)

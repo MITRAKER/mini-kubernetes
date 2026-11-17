@@ -8,6 +8,7 @@ package runtime_test
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -38,7 +39,8 @@ func mkube(t *testing.T, bin string, args ...string) (string, int) {
 	cmd.Stdout, cmd.Stderr = &out, &out
 	err := cmd.Run()
 	code := 0
-	if ee, ok := err.(*exec.ExitError); ok {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
 		code = ee.ExitCode()
 	} else if err != nil {
 		t.Fatal(err)

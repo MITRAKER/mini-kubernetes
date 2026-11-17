@@ -36,93 +36,113 @@ func cpuQuota(milliCPU int64) int64 {
 }
 
 // NewCgroup creates the cgroup for a container and writes its limits. It
-// does not move any process into it yet; call AddProcess for that.
+// does not move any process into it yet; call AddProcess for that. On error
+// it removes whatever it created, so the caller has nothing to clean up.
 func NewCgroup(id string, c *Config) (*Cgroup, error) {
-	name := "mkube-" + id
-	if isCgroupV2() {
-		return newCgroupV2(name, c)
+	if c == nil || id == "" { // precondition (JPL rule 5)
+		return nil, errors.New("NewCgroup: id and config are required")
 	}
-	return newCgroupV1(name, c)
+	name := "mkube-" + id
+	limits := cgroupV1Limits(c)
+	cg := &Cgroup{}
+	var err error
+	if isCgroupV2() {
+		err = cg.setupV2(name, c)
+	} else {
+		err = cg.setupV1(name, limits)
+	}
+	if err != nil {
+		if rmErr := cg.Remove(); rmErr != nil {
+			err = errors.Join(err, rmErr)
+		}
+		return nil, err
+	}
+	return cg, nil
 }
 
-func newCgroupV2(name string, c *Config) (*Cgroup, error) {
+func (cg *Cgroup) mkdir(dir string) error {
+	if err := os.Mkdir(dir, 0o750); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("create cgroup %s: %w", dir, err)
+	}
+	cg.dirs = append(cg.dirs, dir)
+	return nil
+}
+
+func (cg *Cgroup) setupV2(name string, c *Config) error {
 	// Child cgroups can only use controllers their parent enables in
-	// cgroup.subtree_control. Ask for the ones we need; ignore errors
-	// because they may already be on, or the host may not offer them.
-	_ = os.WriteFile(filepath.Join(cgroupRoot, "cgroup.subtree_control"), []byte("+cpu +memory +pids"), 0o644)
+	// cgroup.subtree_control. Ask for the ones we need. The error is
+	// ignored on purpose: they may already be on, or the host may not
+	// offer one, and a missing limit file below reports that precisely.
+	_ = writeFile(cgroupRoot, "cgroup.subtree_control", "+cpu +memory +pids")
 
 	dir := filepath.Join(cgroupRoot, name)
-	if err := os.Mkdir(dir, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
-		return nil, fmt.Errorf("create cgroup: %w", err)
+	if err := cg.mkdir(dir); err != nil {
+		return err
 	}
-	cg := &Cgroup{dirs: []string{dir}}
+	var files []limitFile
 	if c.MemoryBytes > 0 {
-		if err := writeFile(dir, "memory.max", strconv.FormatInt(c.MemoryBytes, 10)); err != nil {
-			return cg, err
-		}
-		// Disable swap so the memory limit is a hard limit.
-		_ = writeFile(dir, "memory.swap.max", "0")
+		files = append(files, limitFile{"memory.max", strconv.FormatInt(c.MemoryBytes, 10), true},
+			// Disable swap so the memory limit is a hard limit (optional:
+			// absent when the kernel has no swap accounting).
+			limitFile{"memory.swap.max", "0", false})
 	}
 	if c.MilliCPU > 0 {
-		v := fmt.Sprintf("%d %d", cpuQuota(c.MilliCPU), cpuPeriodUs)
-		if err := writeFile(dir, "cpu.max", v); err != nil {
-			return cg, err
-		}
+		files = append(files, limitFile{"cpu.max", fmt.Sprintf("%d %d", cpuQuota(c.MilliCPU), cpuPeriodUs), true})
 	}
 	if c.MaxPids > 0 {
-		if err := writeFile(dir, "pids.max", strconv.FormatInt(c.MaxPids, 10)); err != nil {
-			return cg, err
-		}
+		files = append(files, limitFile{"pids.max", strconv.FormatInt(c.MaxPids, 10), true})
 	}
-	return cg, nil
+	return writeLimits(dir, files)
 }
 
-func newCgroupV1(name string, c *Config) (*Cgroup, error) {
-	cg := &Cgroup{}
-	mk := func(controller string) (string, error) {
-		dir := filepath.Join(cgroupRoot, controller, name)
-		if err := os.Mkdir(dir, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
-			return "", fmt.Errorf("create %s cgroup: %w", controller, err)
-		}
-		cg.dirs = append(cg.dirs, dir)
-		return dir, nil
-	}
-	// Always create every controller's directory so that the process is
-	// accounted for even when no limit is set.
-	mem, err := mk("memory")
-	if err != nil {
-		return cg, err
-	}
-	cpu, err := mk("cpu")
-	if err != nil {
-		return cg, err
-	}
-	pids, err := mk("pids")
-	if err != nil {
-		return cg, err
-	}
+// limitFile is one value to write into a cgroup file.
+type limitFile struct {
+	name, value string
+	required    bool // optional files may not exist on every kernel
+}
+
+// cgroupV1Limits lists the files to write per v1 controller.
+func cgroupV1Limits(c *Config) map[string][]limitFile {
+	limits := map[string][]limitFile{"memory": nil, "cpu": nil, "pids": nil}
 	if c.MemoryBytes > 0 {
-		if err := writeFile(mem, "memory.limit_in_bytes", strconv.FormatInt(c.MemoryBytes, 10)); err != nil {
-			return cg, err
-		}
-		// Swap is limited through memsw, which only exists when swap
-		// accounting is enabled.
-		_ = writeFile(mem, "memory.memsw.limit_in_bytes", strconv.FormatInt(c.MemoryBytes, 10))
+		v := strconv.FormatInt(c.MemoryBytes, 10)
+		limits["memory"] = []limitFile{{"memory.limit_in_bytes", v, true},
+			// memsw (memory+swap) only exists when swap accounting is on.
+			{"memory.memsw.limit_in_bytes", v, false}}
 	}
 	if c.MilliCPU > 0 {
-		if err := writeFile(cpu, "cpu.cfs_period_us", strconv.Itoa(cpuPeriodUs)); err != nil {
-			return cg, err
-		}
-		if err := writeFile(cpu, "cpu.cfs_quota_us", strconv.FormatInt(cpuQuota(c.MilliCPU), 10)); err != nil {
-			return cg, err
-		}
+		limits["cpu"] = []limitFile{{"cpu.cfs_period_us", strconv.Itoa(cpuPeriodUs), true},
+			{"cpu.cfs_quota_us", strconv.FormatInt(cpuQuota(c.MilliCPU), 10), true}}
 	}
 	if c.MaxPids > 0 {
-		if err := writeFile(pids, "pids.max", strconv.FormatInt(c.MaxPids, 10)); err != nil {
-			return cg, err
+		limits["pids"] = []limitFile{{"pids.max", strconv.FormatInt(c.MaxPids, 10), true}}
+	}
+	return limits
+}
+
+func (cg *Cgroup) setupV1(name string, limits map[string][]limitFile) error {
+	// Create every controller's directory, in a fixed order, even with no
+	// limit, so the process is always accounted for.
+	for _, controller := range []string{"memory", "cpu", "pids"} {
+		dir := filepath.Join(cgroupRoot, controller, name)
+		if err := cg.mkdir(dir); err != nil {
+			return err
+		}
+		if err := writeLimits(dir, limits[controller]); err != nil {
+			return err
 		}
 	}
-	return cg, nil
+	return nil
+}
+
+func writeLimits(dir string, files []limitFile) error {
+	for _, f := range files {
+		err := writeFile(dir, f.name, f.value)
+		if err != nil && f.required {
+			return err
+		}
+	}
+	return nil
 }
 
 // AddProcess moves a process (and its future children) into the cgroup.
@@ -140,7 +160,7 @@ func (cg *Cgroup) AddProcess(pid int) error {
 func (cg *Cgroup) OOMKilled() bool {
 	for _, dir := range cg.dirs {
 		for _, f := range []string{"memory.events", "memory.oom_control"} {
-			b, err := os.ReadFile(filepath.Join(dir, f))
+			b, err := os.ReadFile(filepath.Join(dir, f)) //nolint:gosec // G304: dir is a cgroup this package created
 			if err != nil {
 				continue
 			}
@@ -168,7 +188,8 @@ func (cg *Cgroup) Remove() error {
 }
 
 func writeFile(dir, file, value string) error {
-	if err := os.WriteFile(filepath.Join(dir, file), []byte(value), 0o644); err != nil {
+	// Cgroup files are owned by root and read by the kernel; 0600 is enough.
+	if err := os.WriteFile(filepath.Join(dir, file), []byte(value), 0o600); err != nil {
 		return fmt.Errorf("write %s=%s: %w", file, value, err)
 	}
 	return nil

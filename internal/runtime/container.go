@@ -43,7 +43,10 @@ type IO struct {
 // The config travels to the child through a pipe. The child blocks reading
 // it, which doubles as a "go" signal: we only send it once the child is in
 // its cgroup, so the user's command can never run unlimited.
-func Run(ctx context.Context, cfg *Config, stdio IO) (Result, error) {
+func Run(ctx context.Context, cfg *Config, stdio IO) (res Result, err error) {
+	if ctx == nil || cfg == nil { // precondition (JPL rule 5)
+		return Result{}, errors.New("runtime.Run: ctx and cfg are required")
+	}
 	if err := cfg.Validate(); err != nil {
 		return Result{}, err
 	}
@@ -53,23 +56,39 @@ func Run(ctx context.Context, cfg *Config, stdio IO) (Result, error) {
 
 	cg, err := NewCgroup(cfg.ID, cfg)
 	if err != nil {
-		if cg != nil {
-			_ = cg.Remove()
-		}
 		return Result{}, err
 	}
-	defer cg.Remove()
+	// A cgroup that cannot be removed is a leak the operator must know
+	// about, so its error is reported unless an earlier error wins.
+	defer func() {
+		if rmErr := cg.Remove(); rmErr != nil && err == nil {
+			err = fmt.Errorf("remove cgroup: %w", rmErr)
+		}
+	}()
 
 	r, w, err := os.Pipe()
 	if err != nil {
 		return Result{}, err
 	}
-	defer r.Close()
-	defer w.Close()
+	defer closeQuietly(w) // both ends are closed explicitly on the success path
+	defer closeQuietly(r)
 
+	cmd := initCommand(ctx, cfg, stdio, r)
+	if err := cmd.Start(); err != nil {
+		return Result{}, fmt.Errorf("start container: %w", err)
+	}
+	if err := handshake(cmd, cg, w, r, cfg); err != nil {
+		return Result{}, err
+	}
+	return waitResult(ctx, cmd, cg)
+}
+
+// initCommand prepares "/proc/self/exe __init" with the clone flags that put
+// it in new namespaces.
+func initCommand(ctx context.Context, cfg *Config, stdio IO, configPipe *os.File) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "/proc/self/exe", InitArg)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdio.Stdin, stdio.Stdout, stdio.Stderr
-	cmd.ExtraFiles = []*os.File{r} // becomes fd 3 in the child
+	cmd.ExtraFiles = []*os.File{configPipe} // becomes fd 3 in the child
 	cmd.Env = []string{}
 
 	flags := uintptr(syscall.CLONE_NEWUTS | // own hostname
@@ -84,25 +103,41 @@ func Run(ctx context.Context, cfg *Config, stdio IO) (Result, error) {
 		// If the runtime dies, take the container with it.
 		Pdeathsig: syscall.SIGKILL,
 	}
+	return cmd
+}
 
-	if err := cmd.Start(); err != nil {
-		return Result{}, fmt.Errorf("start container: %w", err)
+// handshake places the started child in its cgroup and only then sends it
+// the config, which is its signal to continue. On failure the child is
+// killed and reaped, so no process is ever left behind unlimited.
+func handshake(cmd *exec.Cmd, cg *Cgroup, w, r *os.File, cfg *Config) error {
+	// The child has its own copy of the read end now.
+	if err := r.Close(); err != nil {
+		return abort(cmd, fmt.Errorf("close pipe: %w", err))
 	}
-	r.Close()
-
 	if err := cg.AddProcess(cmd.Process.Pid); err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return Result{}, err
+		return abort(cmd, err)
 	}
 	if err := json.NewEncoder(w).Encode(cfg); err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return Result{}, fmt.Errorf("send config: %w", err)
+		return abort(cmd, fmt.Errorf("send config: %w", err))
 	}
-	w.Close()
+	if err := w.Close(); err != nil {
+		return abort(cmd, fmt.Errorf("close pipe: %w", err))
+	}
+	return nil
+}
 
-	err = cmd.Wait()
+// abort kills and reaps a child that failed to start properly. The kill and
+// wait errors are deliberately ignored: the original cause is what matters,
+// and the child is gone either way.
+func abort(cmd *exec.Cmd, cause error) error {
+	_ = cmd.Process.Kill()
+	_ = cmd.Wait()
+	return cause
+}
+
+// waitResult waits for the container and turns how it ended into a Result.
+func waitResult(ctx context.Context, cmd *exec.Cmd, cg *Cgroup) (Result, error) {
+	err := cmd.Wait()
 	res := Result{OOMKilled: cg.OOMKilled()}
 	var exitErr *exec.ExitError
 	switch {
@@ -115,6 +150,12 @@ func Run(ctx context.Context, cfg *Config, stdio IO) (Result, error) {
 		return res, err
 	}
 	return res, nil
+}
+
+// closeQuietly closes a file whose close error carries no information,
+// such as a pipe end that may already be closed. Ignoring it is explicit.
+func closeQuietly(f *os.File) {
+	_ = f.Close()
 }
 
 // exitCode follows the shell convention: a process killed by signal N
@@ -134,7 +175,9 @@ func Init() error {
 	if err := json.NewDecoder(f).Decode(&cfg); err != nil {
 		return fmt.Errorf("read config: %w", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close config pipe: %w", err)
+	}
 
 	if err := syscall.Sethostname([]byte(cfg.Hostname)); err != nil {
 		return fmt.Errorf("set hostname: %w", err)
@@ -148,20 +191,33 @@ func Init() error {
 		}
 	}
 
+	path, env, err := resolveCommand(&cfg)
+	if err != nil {
+		return err
+	}
+	return syscall.Exec(path, cfg.Command, env)
+}
+
+// resolveCommand finds the command's binary inside the container, using the
+// container's PATH (or a standard default), and returns the final
+// environment.
+func resolveCommand(cfg *Config) (string, []string, error) {
 	env := cfg.Env
 	if !hasEnv(env, "PATH") {
 		env = append(env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	}
 	for _, kv := range env {
 		if k, v, ok := strings.Cut(kv, "="); ok && k == "PATH" {
-			os.Setenv("PATH", v)
+			if err := os.Setenv("PATH", v); err != nil {
+				return "", nil, fmt.Errorf("set PATH: %w", err)
+			}
 		}
 	}
 	path, err := exec.LookPath(cfg.Command[0])
 	if err != nil {
-		return fmt.Errorf("find %q in container: %w", cfg.Command[0], err)
+		return "", nil, fmt.Errorf("find %q in container: %w", cfg.Command[0], err)
 	}
-	return syscall.Exec(path, cfg.Command, env)
+	return path, env, nil
 }
 
 func hasEnv(env []string, key string) bool {

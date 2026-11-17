@@ -8,6 +8,7 @@ exercise so you can rebuild or extend it yourself.
 - [Chapter 2: The node agent](#chapter-2-the-node-agent)
 - [Chapter 3: The control plane](#chapter-3-the-control-plane)
 - [Chapter 4: minictl, a small kubectl](#chapter-4-minictl-a-small-kubectl)
+- [Chapter 5: Demo, CI, and presenting the project](#chapter-5-demo-ci-and-presenting-the-project)
 
 ---
 
@@ -733,3 +734,98 @@ never silently break.
 - `kubectl get pods` shows `OOMKilled`. What happened and what do you change?
   (The container hit its memory limit; raise `limits.memory` or fix the leak.)
 - How does `kubectl logs` work under the hood?
+
+---
+
+## Chapter 5: Demo, CI, and presenting the project
+
+**Code:** `scripts/demo.sh`, `.github/workflows/ci.yml`, `Makefile`, `README.md`
+
+### The demo script
+
+`sudo make demo` starts a control plane and **three agents on one machine**.
+Each agent gets its own name, port and log directory, so to the control plane
+they look like three separate machines. Then it walks through the story a
+reviewer wants to see: pods spread across nodes, a node killed with `kill -9`,
+pods replaced on the survivors, scaling, and an OOM kill.
+
+Two shell techniques worth knowing:
+
+- `trap cleanup EXIT` runs the cleanup function however the script ends:
+  success, error (`set -e`) or Ctrl-C. Without it, a failed demo leaves
+  servers running in the background.
+- `mktemp -d` gives each run its own scratch directory, so runs never
+  interfere with each other or with a real installation in `/var/lib/mkube`.
+
+### What `kill -9` taught us: PDEATHSIG
+
+When the demo kills node3's agent with `kill -9`, its containers die too, even
+though the agent had no chance to stop them. That is because the runtime sets
+`Pdeathsig: syscall.SIGKILL` (chapter 1, `container.go`): it asks the kernel
+to kill the container's PID 1 when its parent dies, and killing PID 1 of a PID
+namespace kills everything inside it.
+
+That is a design choice with a trade-off. Real Kubernetes does the opposite:
+containers are parented to a small "shim" process, so **restarting the kubelet
+doesn't restart your containers**, which matters a lot during upgrades. A good
+exercise is to remove PDEATHSIG and make the agent re-adopt running containers
+on start-up (hint: store each container's PID in a file and find its cgroup).
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request, in two jobs:
+
+1. **Lint and unit tests** (no root): `gofmt` must report no unformatted files,
+   `go vet` must pass, and all tests run with the race detector.
+2. **Real containers** (with `sudo`): builds an Alpine rootfs and runs the
+   runtime, agent and end-to-end tests with real namespaces and cgroups.
+
+GitHub's Ubuntu runners use **cgroup v2**, while the machine this project was
+developed on uses **cgroup v1**, so CI is also what proves both code paths in
+`cgroups.go` work. The second job only runs if the first passes (`needs:
+unit`), so cheap checks fail fast.
+
+### How to present this project
+
+**Resume bullets** (pick 2 or 3):
+
+- Built a container orchestrator from scratch in Go, inspired by Kubernetes:
+  container runtime, node agent, API server, scheduler, controllers and CLI
+  (about 2,800 lines of Go plus 1,500 lines of tests, one dependency).
+- Implemented Linux containers directly on namespaces, cgroups v1/v2 and
+  `pivot_root`, enforcing CPU, memory and process limits with OOM detection.
+- Designed level-triggered reconciliation loops for self-healing (node
+  failure detection and pod rescheduling), zero-downtime rolling updates and
+  exponential-backoff restarts.
+- Added optimistic concurrency control with resource versions, and an
+  end-to-end test suite that runs a full multi-node cluster in one process,
+  in CI with real containers.
+
+**The 2-minute story for interviews.** Interviewers love a bug story, and you
+have a real one: *"My first `pivot_root` used a temporary `.oldroot`
+directory. Unit tests passed. When I built the node agent, it started three
+containers from the same image at once, and one failed with 'no such file or
+directory'. All three were creating and deleting the same directory inside the
+shared image. I switched to the `pivot_root(".", ".")` form that runc uses,
+which needs no directory, and added an integration test that starts containers
+in parallel."* It shows debugging, reading other people's code (runc), and
+learning from a failure.
+
+**Questions to be ready for:**
+
+- "Why did you poll instead of using watches?" Simplicity first; explain the
+  trade-off and how watches would work (chapter 3, concept 7).
+- "What happens if the API server dies?" Running containers keep running; the
+  agents keep retrying; nothing new is scheduled until it is back, and it
+  reloads its state from `state.json`.
+- "What would you add next?" Networking between pods on different nodes (a
+  bridge plus routes or VXLAN), or watches, or requests vs. limits.
+
+### Exercises
+
+1. Record the demo with `asciinema rec` (or `vhs`) and add the GIF to the
+   README. A moving demo gets far more attention than text.
+2. Add a `Dockerfile`-free "image build": `minictl image import NAME
+   rootfs.tar.gz` that unpacks a tarball into every node's image directory.
+3. Add pod networking: create a bridge `mkube0`, give each container a
+   `veth` pair and an IP, and let pods on one node reach each other.

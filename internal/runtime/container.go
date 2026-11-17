@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,7 +43,7 @@ type IO struct {
 // The config travels to the child through a pipe. The child blocks reading
 // it, which doubles as a "go" signal: we only send it once the child is in
 // its cgroup, so the user's command can never run unlimited.
-func Run(cfg *Config, stdio IO) (Result, error) {
+func Run(ctx context.Context, cfg *Config, stdio IO) (Result, error) {
 	if err := cfg.Validate(); err != nil {
 		return Result{}, err
 	}
@@ -66,7 +67,7 @@ func Run(cfg *Config, stdio IO) (Result, error) {
 	defer r.Close()
 	defer w.Close()
 
-	cmd := exec.Command("/proc/self/exe", InitArg)
+	cmd := exec.CommandContext(ctx, "/proc/self/exe", InitArg)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdio.Stdin, stdio.Stdout, stdio.Stderr
 	cmd.ExtraFiles = []*os.File{r} // becomes fd 3 in the child
 	cmd.Env = []string{}
@@ -108,6 +109,8 @@ func Run(cfg *Config, stdio IO) (Result, error) {
 	case err == nil:
 	case errors.As(err, &exitErr):
 		res.ExitCode = exitCode(exitErr.ProcessState)
+	case ctx.Err() != nil:
+		res.ExitCode = 137
 	default:
 		return res, err
 	}

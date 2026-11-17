@@ -3,7 +3,6 @@ package runtime
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"syscall"
 	"unsafe"
 )
@@ -25,15 +24,25 @@ func setupRootFS(rootfs string) error {
 		return fmt.Errorf("bind rootfs: %w", err)
 	}
 
-	// pivot_root makes rootfs the new "/" and moves the old root to
-	// put_old. Unlike chroot, the old root can then be unmounted entirely,
+	// pivot_root makes rootfs the new "/" and moves the old root out of
+	// the way. Unlike chroot, the old root can then be unmounted entirely,
 	// so the container has no path back to the host filesystem.
-	putOld := filepath.Join(rootfs, ".oldroot")
-	if err := os.MkdirAll(putOld, 0o700); err != nil {
+	//
+	// We use the pivot_root(".", ".") trick that runc uses: after chdir
+	// into the new root, pivoting "." onto "." stacks the old root on top
+	// of the new one, and unmounting "." removes it. No temporary
+	// directory is needed, which matters because many containers can
+	// share one image directory at the same time.
+	if err := os.Chdir(rootfs); err != nil {
 		return err
 	}
-	if err := syscall.PivotRoot(rootfs, putOld); err != nil {
+	if err := syscall.PivotRoot(".", "."); err != nil {
 		return fmt.Errorf("pivot_root: %w", err)
+	}
+	// Detach the host's filesystem. MNT_DETACH unmounts lazily, which
+	// works even though the old root still has mounts under it.
+	if err := syscall.Unmount(".", syscall.MNT_DETACH); err != nil {
+		return fmt.Errorf("unmount old root: %w", err)
 	}
 	if err := os.Chdir("/"); err != nil {
 		return err
@@ -57,12 +66,7 @@ func setupRootFS(rootfs string) error {
 		return fmt.Errorf("mount /tmp: %w", err)
 	}
 
-	// Detach the host's filesystem. MNT_DETACH unmounts lazily, which
-	// works even though the old root still has mounts under it.
-	if err := syscall.Unmount("/.oldroot", syscall.MNT_DETACH); err != nil {
-		return fmt.Errorf("unmount old root: %w", err)
-	}
-	return os.Remove("/.oldroot")
+	return nil
 }
 
 // setupDev mounts a fresh, minimal /dev instead of exposing the host's

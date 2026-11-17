@@ -11,7 +11,7 @@ primitives, with no Docker or containerd underneath.
 | # | Milestone | Status |
 |---|---|---|
 | 1 | **Container runtime**: namespaces, cgroups (v1 and v2), `pivot_root` | ✅ Done |
-| 2 | **Node agent**: heartbeats, starts and stops assigned containers | Planned |
+| 2 | **Node agent**: heartbeats, reconciliation, restart policies, logs | ✅ Done |
 | 3 | **Control plane**: API server, scheduler, Deployment controller | Planned |
 | 4 | **`minictl` CLI**: apply YAML, get, logs, delete | Planned |
 | 5 | **Demo**: 3-node local cluster, CI, architecture diagram | Planned |
@@ -61,8 +61,11 @@ sudo make test-integration  # starts real containers
 ## Layout
 
 ```text
-cmd/mkube/            CLI entry point
+cmd/mkube/            CLI entry point (run, agent)
 internal/runtime/     namespaces, cgroups, rootfs setup
+internal/agent/       node agent (like the kubelet)
+internal/api/         Node and Pod types shared by every component
+internal/client/      API server HTTP client
 scripts/              rootfs builder
 LEARNING.md           how and why, chapter by chapter
 ```

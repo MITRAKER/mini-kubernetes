@@ -1,9 +1,11 @@
 // Command mkube is the Mini Kubernetes container runtime CLI.
 //
-//	mkube run [flags] -- COMMAND [ARG...]
+//	mkube run [flags] -- COMMAND [ARG...]   run one container
+//	mkube agent [flags]                     run the node agent
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -26,6 +28,8 @@ func main() {
 		}
 	case "run":
 		os.Exit(run(os.Args[2:]))
+	case "agent":
+		os.Exit(runAgent(os.Args[2:]))
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -39,9 +43,10 @@ func usage() {
 	fmt.Fprint(os.Stderr, `mkube - a tiny container runtime
 
 Usage:
-  mkube run [flags] -- COMMAND [ARG...]
+  mkube run [flags] -- COMMAND [ARG...]   run one container
+  mkube agent [flags]                     run the node agent
 
-Run "mkube run -h" for the flags.
+Run "mkube <command> -h" for the flags.
 `)
 }
 
@@ -80,7 +85,7 @@ func run(args []string) int {
 		MaxPids:     *pids,
 		Network:     *network,
 	}
-	res, err := runtime.Run(cfg, runtime.IO{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr})
+	res, err := runtime.Run(context.Background(), cfg, runtime.IO{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "mkube:", err)
 		return 125

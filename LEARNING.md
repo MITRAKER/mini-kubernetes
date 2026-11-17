@@ -5,6 +5,7 @@ was built, why it was designed that way, the concepts behind it, and an
 exercise so you can rebuild or extend it yourself.
 
 - [Chapter 1: A container runtime from scratch](#chapter-1-a-container-runtime-from-scratch)
+- [Chapter 2: The node agent](#chapter-2-the-node-agent)
 
 ---
 
@@ -101,12 +102,22 @@ can be unmounted completely. `setupRootFS` in `rootfs.go` does it in order:
 1. Make all mounts **private**, so nothing we mount leaks back to the host.
 2. **Bind-mount** the rootfs onto itself. `pivot_root` requires the new root to
    be a mount point, and this is the standard trick to make one.
-3. `pivot_root(rootfs, rootfs/.oldroot)`: the rootfs is now `/`.
+3. `chdir` into the rootfs and call `pivot_root(".", ".")`. This stacks the old
+   root on top of the new one; `umount(".", MNT_DETACH)` then peels the old
+   root off. The rootfs is now `/` and the host filesystem is unreachable.
 4. Mount a fresh **`/proc`**. Because we are in a new PID namespace, it shows
    only the container's processes. This is why `ps` inside shows 3 processes.
 5. Mount a small **`/dev`** with only safe devices (`null`, `zero`, `urandom`,
    ...), so the container cannot touch the host's disks.
-6. **Unmount `/.oldroot`**. The host filesystem is now unreachable.
+
+> **A bug found while building milestone 2.** The first version used the
+> textbook form, `pivot_root(rootfs, rootfs/.oldroot)`, then deleted
+> `.oldroot`. It worked for one container. When the node agent started three
+> containers from the same image at the same moment, they all shared one
+> `.oldroot` directory, and one container deleted it while another still
+> needed it. The `pivot_root(".", ".")` form needs no directory at all, which
+> is exactly why runc uses it. Lesson: anything shared between containers
+> (here, the image directory) must never be written to during set-up.
 
 ### Concept 5: Cgroups (what a process can *use*)
 
@@ -177,3 +188,172 @@ A manual check also confirmed `-cpu 500m` holds a busy loop at about 50% CPU.
   gets no default signal handlers, so it must handle SIGTERM itself or it
   ignores `docker stop`.)
 - What does exit code 137 mean?
+
+---
+
+## Chapter 2: The node agent
+
+**Code:** `internal/agent/`, `internal/api/`, `internal/client/`, `cmd/mkube/agent.go`
+
+### What it is
+
+Chapter 1 gave us a way to run *one* container by hand. A cluster needs a
+program on every machine that runs containers *on instruction*. In
+Kubernetes that program is the **kubelet**; ours is `mkube agent`.
+
+```
+            API server  (chapter 3)
+             ▲     │
+ heartbeat,  │     │  "these pods are bound to you"
+ pod status  │     ▼
+          ┌──────────────┐
+          │  mkube agent │  one per machine
+          └──────┬───────┘
+                 │ runtime.Run (chapter 1)
+        ┌────────┼────────┐
+        ▼        ▼        ▼
+      pod A    pod B    pod C
+```
+
+The agent has three jobs:
+
+1. **Heartbeat.** Every 2 seconds it tells the API server "I'm node1, I'm
+   alive, and I have this much CPU and memory." If heartbeats stop, the
+   control plane will treat the node as dead and move its pods (chapter 3).
+2. **Reconcile.** Make the containers on this machine match the pods bound to
+   it: start what is missing, stop what was deleted.
+3. **Report.** Write back what actually happened: Running, Succeeded, Failed,
+   the exit code, OOMKilled, and how many restarts.
+
+### Concept 1: Desired state vs. observed state
+
+Every Kubernetes object has two halves, and so does our `api.Pod`:
+
+- `Spec` is the **desired state**: what someone *wants* (image, command,
+  limits). Users and controllers write it.
+- `Status` is the **observed state**: what is *actually* happening. Only the
+  agent writes it.
+
+Keeping them separate is what lets many independent programs cooperate
+without stepping on each other. Each one owns a clear piece.
+
+### Concept 2: Reconciliation loops (the heart of Kubernetes)
+
+The agent does **not** react to events like "pod created" or "pod deleted".
+Instead, every 2 seconds it asks: "What *should* be running here? What *is*
+running here?" and fixes the difference. That is all `Sync` does:
+
+```go
+for each pod bound to me:   if not running here -> start it
+for each pod running here:  if not bound to me any more -> stop it
+```
+
+Why poll instead of reacting to events? Because events get lost: the network
+drops, the agent crashes and restarts, a message arrives twice. A loop that
+compares *full state* heals itself from all of those automatically. If the
+agent restarts, the next `Sync` simply notices which pods should be running
+and starts them. This property is called being **level-triggered** (look at
+the current level) rather than **edge-triggered** (react to each change).
+Every Kubernetes controller works this way.
+
+### Concept 3: One goroutine per pod
+
+Each pod gets its own goroutine (`runPod`) and its own `context`. The
+goroutine runs the container, waits for it to exit, decides whether to
+restart, and reports status. To stop a pod, the agent calls the context's
+`cancel()`. In chapter 1 we changed `runtime.Run` to use
+`exec.CommandContext`, so cancelling kills the container's PID 1, and the
+kernel then kills everything else in its PID namespace.
+
+The `workers` map is shared between the sync loop and the goroutines, so it
+is guarded by a `sync.Mutex`. The tests run with Go's race detector
+(`go test -race`) to catch any access that forgot to lock.
+
+### Concept 4: Restart policies and CrashLoopBackOff
+
+When a container exits, the pod's `RestartPolicy` decides what happens:
+
+| Policy | Restart when | Typical use |
+|---|---|---|
+| `Always` (default) | any exit | web servers, long-running services |
+| `OnFailure` | exit code ≠ 0 | batch jobs that should retry |
+| `Never` | never | one-shot tasks |
+
+If a container keeps crashing, restarting it instantly would burn CPU in a
+tight loop. So the agent waits before each restart, and **doubles** the wait
+each time (1s, 2s, 4s, ... up to 30s). This is **exponential backoff**, and
+it is exactly the `CrashLoopBackOff` status you see in `kubectl get pods`. If
+a container ran for a good while before exiting, the delay resets, because
+that is not a crash loop.
+
+### Concept 5: Logs stay on the node
+
+A container's stdout and stderr go to `/var/lib/mkube/logs/<pod>.log` on the
+node. The API server never stores logs; that would make it a bottleneck. So
+the agent runs its own small HTTP server with `GET /logs/{pod}`, and the CLI
+(chapter 4) will fetch logs straight from the node. Real Kubernetes does the
+same: `kubectl logs` is proxied to the kubelet on port 10250, which is why our
+agent uses that port too.
+
+### Concept 6: Testing with fakes
+
+The agent depends on two things that are hard to use in tests: an API server
+(doesn't exist yet) and real containers (need root). So the tests replace both:
+
+- **A fake API server**: an `httptest.Server` holding pods in a map. The agent
+  talks to it over real HTTP, so the client code is tested too.
+- **A fake runner**: `Agent.Run` is a function field, so tests pass in a
+  function that pretends to run a container and returns a scripted exit code.
+
+This is **dependency injection**: the agent receives its dependencies instead
+of creating them. It let us test restart policies, backoff, OOMKilled
+reporting, missing images and log serving in about one second, with no root.
+
+There is also a test with the real runtime. It hits a neat problem: the
+runtime starts containers by re-running `/proc/self/exe`, and under `go test`
+that is the *test binary*. `TestMain` in `integration_test.go` solves it by
+checking for the `__init` argument and becoming the container's init process.
+
+### The bug this milestone found
+
+The real-container test runs three pods at once from the same image, and one
+failed with `remove /.oldroot: no such file or directory`. Chapter 1's
+`pivot_root` created and deleted a temporary `.oldroot` directory *inside the
+shared image*, so parallel containers raced on it. The fix (see the note in
+chapter 1) was the `pivot_root(".", ".")` form, which needs no directory. This
+is a classic lesson: unit tests with fakes passed, and only a test with real
+parallel containers found the bug.
+
+### Try it
+
+The agent needs the API server from chapter 3 to be useful, so for now run
+the tests:
+
+```bash
+go test -race ./internal/agent/                          # fakes, no root
+sudo MKUBE_ROOTFS=$PWD/rootfs go test ./internal/agent/  # real containers
+```
+
+### Exercises
+
+1. **Liveness probes.** Add `Spec.LivenessCommand`. Every 10 seconds the agent
+   runs it inside the container (hint: `nsenter`, or `setns()` into the
+   container's namespaces); if it fails 3 times, kill and restart the pod.
+2. **Graceful shutdown.** Today stopping a pod is an instant SIGKILL. Send
+   SIGTERM first, wait up to 10 seconds, then SIGKILL, like Kubernetes'
+   `terminationGracePeriodSeconds`.
+3. **Copy-on-write images.** All pods using the same image share one
+   directory, so a file written by one pod is seen by the others. Mount an
+   **overlayfs** per container (`lowerdir` = image, `upperdir` = a per-pod
+   directory) so writes stay private. This is how Docker image layers work.
+4. **Log rotation.** Cap each log file at 10 MB.
+
+### Interview questions this chapter prepares you for
+
+- What does the kubelet do? (Registers the node, heartbeats, runs pods bound
+  to its node, reports status, serves logs and exec.)
+- What is the difference between `spec` and `status`?
+- What does "level-triggered" mean, and why does Kubernetes prefer it?
+- What is CrashLoopBackOff, and how would you debug it? (`kubectl logs
+  --previous`, check the exit code: 137 means OOMKilled or killed, 1 means the
+  app itself errored.)

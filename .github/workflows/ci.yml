@@ -25,7 +25,7 @@ jobs:
           # standard-library vulnerabilities (govulncheck fails on them).
           go-version: stable
           check-latest: true
-      - uses: golangci/golangci-lint-action@v8
+      - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.15.0
           # Build the linter with this job's Go, so it can always read the

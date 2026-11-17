@@ -899,6 +899,16 @@ its tests. Fixing them was not just cosmetic:
 | **Integration tests as root** | Bugs only real namespaces and cgroups reveal (remember `.oldroot`) | CI `integration` job |
 | **Coverage gate** | Untested code creeping in. The threshold is 65% because about a third of the code needs a real multi-machine setup or failure injection to reach | CI `integration` job |
 | **govulncheck** | Known CVEs in dependencies *and the Go standard library*, only if your code actually calls the vulnerable function | CI `security` job |
+
+> **What govulncheck caught on the first CI run.** CI built with Go 1.23.12,
+> the version named in `go.mod`, and govulncheck failed: 38 known
+> vulnerabilities in that release's standard library (`net/http`,
+> `crypto/x509`, ...) were reachable from our code, for example through
+> `http.Client.Do`. Our code was fine; the *toolchain* was out of date. The
+> fix was to build with the latest stable Go (`go-version: stable` in the
+> workflows) while keeping `go 1.23` in `go.mod` as the minimum language
+> version. Lesson: your dependencies include the compiler and standard
+> library, and they need patching too.
 | **CodeQL** | Deeper security flaws (injection, path traversal) by analysing data flow | Every PR and weekly |
 | **Dependabot** | Outdated dependencies and GitHub Actions | Weekly pull requests |
 | **pre-commit** | All of the above that is fast, before code even leaves your machine | Every `git commit` |

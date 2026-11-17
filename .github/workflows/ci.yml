@@ -20,7 +20,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # Build with the newest patched Go release. go.mod's "go 1.23" is
+          # only the minimum language version; an old toolchain ships known
+          # standard-library vulnerabilities (govulncheck fails on them).
+          go-version: stable
+          check-latest: true
       - uses: golangci/golangci-lint-action@v8
         with:
           version: v2.5.0
@@ -32,7 +36,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # Build with the newest patched Go release. go.mod's "go 1.23" is
+          # only the minimum language version; an old toolchain ships known
+          # standard-library vulnerabilities (govulncheck fails on them).
+          go-version: stable
+          check-latest: true
       - name: Module files are tidy
         run: go mod tidy -diff
       - name: Build
@@ -48,7 +56,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # Build with the newest patched Go release. go.mod's "go 1.23" is
+          # only the minimum language version; an old toolchain ships known
+          # standard-library vulnerabilities (govulncheck fails on them).
+          go-version: stable
+          check-latest: true
       - name: Build root filesystem
         run: ./scripts/make-rootfs.sh "$RUNNER_TEMP/rootfs"
       - name: All tests as root, with coverage
@@ -70,6 +82,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # Build with the newest patched Go release. go.mod's "go 1.23" is
+          # only the minimum language version; an old toolchain ships known
+          # standard-library vulnerabilities (govulncheck fails on them).
+          go-version: stable
+          check-latest: true
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...

@@ -6,7 +6,9 @@ welcome as new features.
 
 ## Getting started
 
-You need Linux, Go 1.23+ and, for the integration tests, root.
+You need Linux, the latest stable Go release (the code needs 1.23 or newer, but
+older toolchains have known standard-library vulnerabilities that
+`govulncheck` reports) and, for the integration tests, root.
 
 ```bash
 git clone https://github.com/MITRAKER/mini-kubernetes

@@ -25,6 +25,8 @@ uses [Semantic Versioning](https://semver.org/).
   tests, real-container integration tests, 65% coverage gate, govulncheck,
   CodeQL, Dependabot, tagged releases.
 - `LEARNING.md`: six chapters explaining every part of the project.
+- CI and releases build with the latest stable Go, so binaries never ship
+  with known standard-library vulnerabilities.
 
 ### Fixed
 

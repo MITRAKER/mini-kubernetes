@@ -1,0 +1,88 @@
+# Static analysis configuration (golangci-lint v2). Each linter is mapped to
+# the NASA/JPL "Power of Ten" rule it helps enforce; see LEARNING.md,
+# chapter 6. CI fails on any finding (Rule 10: zero warnings).
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    # Rule 1: simple control flow
+    - gocyclo         # cyclomatic complexity per function
+    - gocognit        # cognitive complexity (nesting weighs more)
+    - nestif          # deeply nested if statements
+    - nakedret        # no naked returns in long functions
+    # Rule 4: small functions
+    - funlen          # at most 60 lines / 40 statements per function
+    # Rule 6: smallest possible scope
+    - ineffassign
+    - wastedassign
+    - unused
+    # Rule 7: check every return value
+    - errcheck
+    - errorlint       # compare and wrap errors correctly (errors.Is/As)
+    - bodyclose       # HTTP response bodies must be closed
+    - noctx           # HTTP requests carry a context, so waits are bounded
+    # Rule 9: restricted use of unsafe, and general safety
+    - gosec
+    # Rule 10: all warnings on, static analyzers
+    - govet
+    - staticcheck
+    - revive
+    - unconvert
+    - unparam
+    - misspell
+
+  settings:
+    funlen:
+      lines: 60       # JPL: a function should fit on one printed page
+      statements: 40
+    gocyclo:
+      min-complexity: 12
+    gocognit:
+      min-complexity: 20
+    nestif:
+      min-complexity: 4
+    errcheck:
+      check-type-assertions: true
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment  # memory-layout micro-optimisation; hurts readability
+        - shadow          # too noisy with Go's err := idiom
+    revive:
+      rules:
+        - name: exported
+        - name: var-naming
+        - name: indent-error-flow
+        - name: error-return
+        - name: error-strings
+        - name: early-return
+        - name: unused-parameter
+        - name: unreachable-code
+        - name: defer
+    gosec:
+      excludes:
+        - G204  # exec with variable args: running user commands is the runtime's job
+
+  exclusions:
+    rules:
+      # Tests may be long table-driven scenarios; production code may not.
+      - path: _test\.go
+        linters: [funlen, gocognit, gocyclo, errcheck, gosec, noctx, bodyclose]
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/MITRAKER/mini-kubernetes
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

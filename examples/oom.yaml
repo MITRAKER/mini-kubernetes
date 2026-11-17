@@ -1,0 +1,9 @@
+# This pod tries to use 200 MB under a 32 MiB limit. The kernel kills it,
+# and `minictl get pods` shows OOMKilled.
+kind: Pod
+name: memory-hog
+spec:
+  image: alpine
+  command: ["sh", "-c", "x=$(head -c 200000000 /dev/zero | tr '\\0' a)"]
+  limits: {memory: 32Mi}
+  restartPolicy: Never

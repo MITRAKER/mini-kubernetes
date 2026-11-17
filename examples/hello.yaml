@@ -1,0 +1,8 @@
+# A Deployment keeps 3 copies of this pod running, spread over the nodes.
+kind: Deployment
+name: hello
+replicas: 3
+template:
+  image: alpine
+  command: ["sh", "-c", "echo hello from $(hostname); while true; do sleep 5; echo still alive; done"]
+  limits: {cpu: 100m, memory: 32Mi}

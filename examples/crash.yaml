@@ -1,0 +1,8 @@
+# This pod exits with an error every time, so the agent restarts it with a
+# growing delay: CrashLoopBackOff.
+kind: Pod
+name: crasher
+spec:
+  image: alpine
+  command: ["sh", "-c", "echo starting; exit 1"]
+  restartPolicy: Always

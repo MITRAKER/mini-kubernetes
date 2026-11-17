@@ -909,6 +909,15 @@ its tests. Fixing them was not just cosmetic:
 > workflows) while keeping `go 1.23` in `go.mod` as the minimum language
 > version. Lesson: your dependencies include the compiler and standard
 > library, and they need patching too.
+>
+> Moving to the newest Go then broke two *tools*: govulncheck v1.1.4
+> crashed parsing Go 1.27's standard library, and the prebuilt
+> golangci-lint v2.5.0 could not read its export data. Both were upgraded
+> (govulncheck v1.9.0, golangci-lint v2.15.0, now built from source with the
+> job's own Go). The newer linter also found a real issue: the agent logged a
+> pod name taken straight from an HTTP request, so a name containing a
+> newline could forge log lines ("log injection"). Tools age like any other
+> dependency, which is why Dependabot watches the workflows too.
 | **CodeQL** | Deeper security flaws (injection, path traversal) by analysing data flow | Every PR and weekly |
 | **Dependabot** | Outdated dependencies and GitHub Actions | Weekly pull requests |
 | **pre-commit** | All of the above that is fast, before code even leaves your machine | Every `git commit` |

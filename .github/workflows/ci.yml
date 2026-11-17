@@ -27,7 +27,10 @@ jobs:
           check-latest: true
       - uses: golangci/golangci-lint-action@v8
         with:
-          version: v2.5.0
+          version: v2.15.0
+          # Build the linter with this job's Go, so it can always read the
+          # standard library of the toolchain it is checking.
+          install-mode: goinstall
 
   unit:
     name: Unit tests (race detector)
@@ -88,4 +91,4 @@ jobs:
           go-version: stable
           check-latest: true
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...

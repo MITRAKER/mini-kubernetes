@@ -333,7 +333,9 @@ func (a *Agent) Handler() http.Handler {
 		defer func() { _ = f.Close() }() // read-only: close cannot lose data
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		if _, err := io.Copy(w, f); err != nil {
-			log.Printf("agent %s: send logs of %s: %v", a.Name, pod, err)
+			// The pod name comes from the request, so it is not logged: a
+			// crafted name containing newlines could forge log lines.
+			log.Printf("agent %s: send logs: %v", a.Name, err)
 		}
 	})
 	return mux

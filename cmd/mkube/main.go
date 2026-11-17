@@ -2,6 +2,7 @@
 //
 //	mkube run [flags] -- COMMAND [ARG...]   run one container
 //	mkube agent [flags]                     run the node agent
+//	mkube server [flags]                    run the control plane
 package main
 
 import (
@@ -30,6 +31,8 @@ func main() {
 		os.Exit(run(os.Args[2:]))
 	case "agent":
 		os.Exit(runAgent(os.Args[2:]))
+	case "server":
+		os.Exit(runServer(os.Args[2:]))
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -45,6 +48,7 @@ func usage() {
 Usage:
   mkube run [flags] -- COMMAND [ARG...]   run one container
   mkube agent [flags]                     run the node agent
+  mkube server [flags]                    run the control plane
 
 Run "mkube <command> -h" for the flags.
 `)

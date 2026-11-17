@@ -69,6 +69,10 @@ type PodStatus struct {
 // Pod is the smallest thing the cluster runs: one container.
 type Pod struct {
 	Name string `json:"name"`
+	// ResourceVersion changes on every write. Sending back the version you
+	// read lets the API server reject your update if someone else changed
+	// the object in between (optimistic concurrency).
+	ResourceVersion int64 `json:"resourceVersion,omitempty"`
 	// Labels are free-form tags. Controllers use them to find the pods
 	// they own.
 	Labels map[string]string `json:"labels,omitempty"`
@@ -76,4 +80,30 @@ type Pod struct {
 	// NodeName is empty until the scheduler binds the pod to a node.
 	NodeName string    `json:"nodeName,omitempty"`
 	Status   PodStatus `json:"status"`
+}
+
+// Deployment keeps a number of identical pods running. Its controller
+// creates pods labelled "deployment=<name>" from Template until Replicas of them
+// are alive, and deletes extras.
+type Deployment struct {
+	Name            string           `json:"name"`
+	ResourceVersion int64            `json:"resourceVersion,omitempty"`
+	Replicas        int              `json:"replicas"`
+	Template        PodSpec          `json:"template"`
+	Status          DeploymentStatus `json:"status"`
+}
+
+// DeploymentStatus is what the controller last observed.
+type DeploymentStatus struct {
+	Replicas      int `json:"replicas"`      // pods that exist
+	ReadyReplicas int `json:"readyReplicas"` // pods that are Running
+}
+
+// DeploymentLabel is the label key that ties a pod to the Deployment that
+// owns it.
+const DeploymentLabel = "deployment"
+
+// Terminated reports whether a pod's process has finished for good.
+func (p *Pod) Terminated() bool {
+	return p.Status.Phase == PodSucceeded || p.Status.Phase == PodFailed
 }

@@ -10,6 +10,10 @@
 //	PUT    /api/pods/{name}/status        update a pod's status
 //	PUT    /api/pods/{name}/binding       assign a pod to a node
 //	DELETE /api/pods/{name}               delete a pod
+//	PUT    /api/deployments/{name}        create or update a deployment
+//	GET    /api/deployments[/{name}]      list or get deployments
+//	PUT    /api/deployments/{name}/status update a deployment's status
+//	DELETE /api/deployments/{name}        delete a deployment
 package client
 
 import (
@@ -120,4 +124,38 @@ func (c *Client) BindPod(ctx context.Context, pod, node string) error {
 // DeletePod deletes a pod.
 func (c *Client) DeletePod(ctx context.Context, name string) error {
 	return c.do(ctx, http.MethodDelete, "/api/pods/"+url.PathEscape(name), nil, nil)
+}
+
+// ApplyDeployment creates or updates a deployment.
+func (c *Client) ApplyDeployment(ctx context.Context, d *api.Deployment) (*api.Deployment, error) {
+	var out api.Deployment
+	if err := c.do(ctx, http.MethodPut, "/api/deployments/"+url.PathEscape(d.Name), d, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// GetDeployment returns one deployment.
+func (c *Client) GetDeployment(ctx context.Context, name string) (*api.Deployment, error) {
+	var out api.Deployment
+	if err := c.do(ctx, http.MethodGet, "/api/deployments/"+url.PathEscape(name), nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListDeployments returns every deployment.
+func (c *Client) ListDeployments(ctx context.Context) ([]api.Deployment, error) {
+	var out []api.Deployment
+	return out, c.do(ctx, http.MethodGet, "/api/deployments", nil, &out)
+}
+
+// UpdateDeploymentStatus records what the controller observed.
+func (c *Client) UpdateDeploymentStatus(ctx context.Context, name string, s api.DeploymentStatus) error {
+	return c.do(ctx, http.MethodPut, "/api/deployments/"+url.PathEscape(name)+"/status", s, nil)
+}
+
+// DeleteDeployment deletes a deployment; its controller then removes its pods.
+func (c *Client) DeleteDeployment(ctx context.Context, name string) error {
+	return c.do(ctx, http.MethodDelete, "/api/deployments/"+url.PathEscape(name), nil, nil)
 }

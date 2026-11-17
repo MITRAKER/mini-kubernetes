@@ -6,6 +6,7 @@ exercise so you can rebuild or extend it yourself.
 
 - [Chapter 1: A container runtime from scratch](#chapter-1-a-container-runtime-from-scratch)
 - [Chapter 2: The node agent](#chapter-2-the-node-agent)
+- [Chapter 3: The control plane](#chapter-3-the-control-plane)
 
 ---
 
@@ -357,3 +358,213 @@ sudo MKUBE_ROOTFS=$PWD/rootfs go test ./internal/agent/  # real containers
 - What is CrashLoopBackOff, and how would you debug it? (`kubectl logs
   --previous`, check the exit code: 137 means OOMKilled or killed, 1 means the
   app itself errored.)
+
+---
+
+## Chapter 3: The control plane
+
+**Code:** `internal/apiserver/`, `internal/scheduler/`, `internal/controller/`,
+`cmd/mkube/server.go`, `test/e2e/`
+
+### The picture
+
+```
+                 ┌────────────── mkube server ──────────────┐
+  you / CLI ───▶ │  API server  ◀──▶  store (state.json)     │
+                 │     ▲   ▲                                 │
+                 │     │   └── scheduler   (binds pods)      │
+                 │     └────── controllers (deployments,     │
+                 │                          dead nodes)      │
+                 └─────▲────────────────────────────────────┘
+                       │ HTTP: heartbeats, "my pods?", status
+          ┌────────────┼────────────┐
+     mkube agent  mkube agent  mkube agent
+       node1        node2        node3
+```
+
+The rule that makes this work: **every component talks only to the API
+server**. The scheduler never calls an agent; the controller never calls the
+scheduler. Each one reads state, writes state, and the others notice on their
+next loop. You can kill and restart any one of them and the cluster carries
+on from what is stored.
+
+### Concept 1: The API server and its store
+
+The API server is a plain REST API over JSON (`server.go`):
+
+```
+PUT  /api/deployments/web        create or update a Deployment
+GET  /api/pods?node=node1        what the agent on node1 asks every 2s
+PUT  /api/pods/web-x7k2p/binding what the scheduler writes
+PUT  /api/pods/web-x7k2p/status  what the agent writes
+```
+
+Behind it is the **store** (`store.go`), our stand-in for **etcd**. It holds
+everything in memory and writes a JSON snapshot to disk after every change.
+The snapshot is written to a temporary file and then **renamed** over the old
+one. A rename is atomic on Linux, so a crash can never leave a half-written
+file. This write-then-rename pattern is used by almost every database and
+editor.
+
+The API server also **validates** everything on the way in: names must be DNS
+labels (`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`), which also stops tricks like a pod
+named `../../etc`, unknown JSON fields are rejected, and request bodies are
+capped at 1 MB. Validation at the front door means no other component has to
+defend against bad data.
+
+### Concept 2: Optimistic concurrency (resourceVersion)
+
+Two people run `minictl scale web` at the same moment. Both read the
+Deployment, both change it, both write it back. Without protection, the
+second write silently erases the first. This is the **lost update** problem.
+
+Kubernetes' answer, and ours: every object has a `resourceVersion` that
+changes on every write. When you write, you send back the version you read.
+If it no longer matches, someone else got there first, and the server answers
+**409 Conflict**: "read it again and retry". No locks are held between read
+and write, which is why this is called *optimistic* concurrency.
+`TestOptimisticConcurrency` in `store_test.go` shows it.
+
+Binding a pod uses the same idea in a simpler form: `BindPod` refuses to bind
+a pod that already has a node, so if two schedulers race, exactly one wins.
+
+### Concept 3: The scheduler (filter, then score)
+
+Every second the scheduler (`scheduler.go`) finds pods with no `nodeName` and,
+for each one:
+
+1. **Filter** out nodes that can't take it: NotReady nodes, and nodes whose
+   free CPU or memory (capacity minus the limits of pods already there) is too
+   small.
+2. **Score** the rest with **least-allocated**: the average share of CPU and
+   memory that would still be free after placing the pod. Highest wins, which
+   spreads pods evenly. Ties go to the first name, so results are repeatable.
+3. **Bind**: write the node's name into the pod. That is all. The agent on
+   that node sees it on its next sync and starts the container.
+
+A pod that fits nowhere just stays `Pending` and is retried every second, the
+same behaviour you see in Kubernetes when a cluster is full.
+
+Note it counts *limits*, not actual usage. Real Kubernetes schedules on
+*requests* (a guaranteed minimum) and enforces *limits* (a maximum). We use
+one number for both to keep things simple; adding requests is an exercise.
+
+### Concept 4: The deployment controller
+
+You almost never create pods by hand in Kubernetes. You create a
+**Deployment** that says "keep 3 copies of this pod running", and a controller
+makes it so. Ours (`controller.go`) does, every second, for each Deployment:
+
+1. Find its pods by **label** `deployment=<name>`. Labels are how Kubernetes
+   objects find each other; there are no hard links between them.
+2. Delete pods that **finished for good** (for example OOMKilled with
+   `restartPolicy: Never`) so they get replaced.
+3. **Too few?** Create pods from the template, named `<deployment>-<5
+   random letters>`. (Ours skips vowels, as Kubernetes does, so a random name
+   never spells a rude word.)
+4. **Template changed?** Do a **rolling update** (below).
+5. **Too many?** Delete extras, least useful first: unscheduled, then not
+   ready, then the rest.
+
+It only takes **one kind of step per pass**. The next pass, one second later,
+sees the result and takes the next step. Small steps are easy to reason about
+and safe to repeat.
+
+When you delete a Deployment, its pods suddenly have an owner label pointing
+at nothing. The controller deletes them: this is **garbage collection**.
+
+### Concept 5: Rolling updates
+
+Change the template (a new command, new env) and the controller replaces pods
+one at a time, without ever dropping below the desired count:
+
+- **maxSurge 1**: it may create one *extra* new pod first.
+- **maxUnavailable 0**: it deletes an old pod only when, without it, there are
+  still enough ready pods.
+
+So with 3 replicas you go 3 old → 3 old + 1 new → 2 old + 1 new → 2 old + 2
+new → ... → 3 new. If the new version crashes on start, the new pod never
+becomes ready, the old pods are never deleted, and the rollout just stops. A
+bad release can't take your service down. This is exactly what Kubernetes
+does with its default settings.
+
+### Concept 6: The node controller and self-healing
+
+Each agent heartbeats every 2 seconds. If a node's last heartbeat is older
+than 10 seconds, the node controller:
+
+1. marks the node **NotReady**, so the scheduler stops placing pods there, and
+2. **evicts** its pods by deleting them.
+
+The deployment controller then sees it is short of pods and creates new ones,
+and the scheduler puts them on healthy nodes. No component was told "node2
+died"; each one just reacted to the state it saw. That is self-healing as an
+*emergent* property of independent loops.
+
+If node2 comes back, its agent asks "what are my pods?", gets an empty list,
+and stops the orphaned containers it still has. Note that a *bare* pod (one
+with no Deployment) on a dead node is simply gone, which is why you should
+use Deployments.
+
+### Concept 7: Polling vs. watching
+
+All our components **poll**: they ask for the full list every 1 to 2 seconds.
+Simple and robust, but with 5,000 nodes polling 100,000 pods it would melt the
+API server. Real Kubernetes uses **watches**: a client lists once, then keeps
+an HTTP connection open and the server streams every change ("pod web-x
+modified, resourceVersion 1234"). Components keep a local cache
+("informer") updated from the stream. It is the same level-triggered design,
+just with far less traffic. Implementing a watch is a great exercise.
+
+### How it was verified
+
+- `store_test.go`: duplicate names, double binding, stale `resourceVersion`
+  rejected, state survives a restart, validation rejects bad names and images.
+- `scheduler_test.go`: filtering by readiness and capacity, spreading.
+- `test/e2e/cluster_test.go` runs a **whole cluster in one test**: API server,
+  scheduler, controllers and two agents over real HTTP. It creates a 4-replica
+  Deployment and checks pods are spread 2/2, scales to 2, **kills the busier
+  node** and checks its pods are replaced on the other node and the node is
+  NotReady, does a rolling update, and deletes the Deployment. It runs once
+  with fake containers and once with real Linux containers.
+- A manual run of the real binaries: `mkube server` + `mkube agent`, a
+  Deployment created with `curl`, two real `sleep` containers running,
+  `hello from hello-5jkv6` read through the agent's log endpoint, and the
+  containers gone after the agent stopped.
+
+### Try it
+
+```bash
+make build && sudo ./scripts/make-rootfs.sh rootfs
+sudo mkdir -p /var/lib/mkube/images && sudo ln -s $PWD/rootfs /var/lib/mkube/images/alpine
+sudo ./bin/mkube server &
+sudo ./bin/mkube agent -name node1 &
+curl -X PUT localhost:6443/api/deployments/hello -d '{"name":"hello","replicas":2,
+  "template":{"image":"alpine","command":["sh","-c","echo hi from $(hostname); sleep 1000"]}}'
+curl -s localhost:6443/api/pods
+```
+
+Chapter 4 replaces those `curl` calls with a proper CLI.
+
+### Exercises
+
+1. **Requests vs. limits.** Add `Spec.Requests`, schedule on requests and
+   enforce limits. Then you can overcommit a node, like real clusters do.
+2. **Node selectors.** Add `Labels` to nodes and `NodeSelector` to pods, and
+   filter nodes that don't match (e.g. `disk=ssd`).
+3. **Watch API.** Add `GET /api/pods?watch=true` that streams changes as
+   newline-separated JSON, and switch the agent to it.
+4. **Leader election.** Run two `mkube server` processes for high
+   availability. Only one scheduler may act at a time: store a "lease" object
+   with a holder name and expiry, and use `resourceVersion` to take it over
+   safely.
+
+### Interview questions this chapter prepares you for
+
+- What are the components of the Kubernetes control plane, and what does each
+  do? (API server, etcd, scheduler, controller manager.)
+- How does the scheduler pick a node? (Filter, then score.)
+- What happens, step by step, when a node dies?
+- How does a rolling update avoid downtime? (maxSurge, maxUnavailable,
+  readiness.)
+- What is `resourceVersion` for? (Optimistic concurrency, and resuming watches.)

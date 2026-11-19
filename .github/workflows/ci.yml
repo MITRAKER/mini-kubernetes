@@ -17,7 +17,7 @@ jobs:
     name: Lint (golangci-lint, JPL rules)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           # Build with the newest patched Go release. go.mod's "go 1.23" is
@@ -36,7 +36,7 @@ jobs:
     name: Unit tests (race detector)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           # Build with the newest patched Go release. go.mod's "go 1.23" is
@@ -56,7 +56,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [lint, unit]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           # Build with the newest patched Go release. go.mod's "go 1.23" is
@@ -82,7 +82,7 @@ jobs:
     name: Security (govulncheck, gosec via lint)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           # Build with the newest patched Go release. go.mod's "go 1.23" is

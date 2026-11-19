@@ -89,7 +89,11 @@ func initCommand(ctx context.Context, cfg *Config, stdio IO, configPipe *os.File
 	cmd := exec.CommandContext(ctx, "/proc/self/exe", InitArg)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdio.Stdin, stdio.Stdout, stdio.Stderr
 	cmd.ExtraFiles = []*os.File{configPipe} // becomes fd 3 in the child
-	cmd.Env = []string{}
+	// The init process gets no host environment; the command's own
+	// environment travels in the config. GOMAXPROCS=1 keeps the Go
+	// runtime's thread count low, because every thread counts against
+	// the pids limit until init execs the command.
+	cmd.Env = []string{"GOMAXPROCS=1"}
 
 	flags := uintptr(syscall.CLONE_NEWUTS | // own hostname
 		syscall.CLONE_NEWPID | // own process tree: the command is PID 1

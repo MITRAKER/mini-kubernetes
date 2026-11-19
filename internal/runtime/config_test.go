@@ -46,9 +46,13 @@ func TestCPUQuota(t *testing.T) {
 }
 
 func TestValidate(t *testing.T) {
-	ok := Config{ID: "web", RootFS: "/r", Command: []string{"sh"}}
-	if err := ok.Validate(); err != nil {
-		t.Fatalf("valid config rejected: %v", err)
+	for _, ok := range []Config{
+		{ID: "web", RootFS: "/r", Command: []string{"sh"}},
+		{ID: "web", RootFS: "/r", Command: []string{"sh"}, MaxPids: MinPids},
+	} {
+		if err := ok.Validate(); err != nil {
+			t.Fatalf("valid config rejected: %v", err)
+		}
 	}
 	bad := []Config{
 		{RootFS: "/r", Command: []string{"sh"}},
@@ -56,6 +60,7 @@ func TestValidate(t *testing.T) {
 		{ID: "web", Command: []string{"sh"}},
 		{ID: "web", RootFS: "/r"},
 		{ID: "web", RootFS: "/r", Command: []string{"sh"}, MemoryBytes: -1},
+		{ID: "web", RootFS: "/r", Command: []string{"sh"}, MaxPids: MinPids - 1},
 	}
 	for i, c := range bad {
 		if err := c.Validate(); err == nil {

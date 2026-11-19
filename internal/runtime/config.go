@@ -54,8 +54,18 @@ func (c *Config) Validate() error {
 	if c.MemoryBytes < 0 || c.MilliCPU < 0 || c.MaxPids < 0 {
 		return fmt.Errorf("limits must not be negative")
 	}
+	if c.MaxPids > 0 && c.MaxPids < MinPids {
+		return fmt.Errorf("pids limit %d is below the minimum of %d", c.MaxPids, MinPids)
+	}
 	return nil
 }
+
+// MinPids is the smallest process limit a container may have. The pids
+// controller counts threads, and the Go init process that sets up the
+// container already runs several before it execs the real command. A
+// smaller limit would make the Go runtime itself fail to start a thread
+// ("pthread_create failed") instead of failing the command's fork.
+const MinPids = 16
 
 // ParseMemory turns a Kubernetes-style quantity such as "64Mi", "1Gi",
 // "500k" or "1048576" into bytes.

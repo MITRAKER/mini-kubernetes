@@ -166,7 +166,16 @@ from.
 - a network namespace has only `lo`,
 - `exit 7` inside gives exit code 7 outside,
 - allocating 200 MB under a 32 MiB limit gets OOM-killed with exit 137,
-- forking 8 processes under `-pids 5` fails.
+- forking 32 processes under `-pids 16` fails.
+
+> **A lesson from CI:** the first version of this test used `-pids 5`, and it
+> failed now and then with `pthread_create failed` instead of a fork error.
+> The pids controller counts *threads*, not just processes, and the container
+> starts as our Go init process, which runs a few runtime threads before it
+> execs the command. With a tiny limit, the Go runtime itself ran out. The fix:
+> start init with `GOMAXPROCS=1` (fewer threads) and refuse limits below
+> `MinPids` (16). Real runtimes have the same issue: runc's own Go init also
+> runs inside the container's cgroup.
 
 A manual check also confirmed `-cpu 500m` holds a busy loop at about 50% CPU.
 

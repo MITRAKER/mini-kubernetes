@@ -6,6 +6,12 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- A container with a very small process limit could crash in the Go init
+  process (`pthread_create failed`) before running its command. Init now
+  starts with `GOMAXPROCS=1`, and process limits below 16 are rejected.
+
 ## [0.1.0] - 2026-11-17
 
 ### Added

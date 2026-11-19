@@ -82,8 +82,8 @@ func TestMemoryLimit(t *testing.T) {
 
 func TestPidsLimit(t *testing.T) {
 	bin, rootfs := buildMkube(t)
-	out, _ := mkube(t, bin, "run", "-name", "pids", "-rootfs", rootfs, "-pids", "5", "--",
-		"sh", "-c", "for i in 1 2 3 4 5 6 7 8; do sleep 1 & done; wait")
+	out, _ := mkube(t, bin, "run", "-name", "pids", "-rootfs", rootfs, "-pids", "16", "--",
+		"sh", "-c", "i=0; while [ $i -lt 32 ]; do sleep 1 & i=$((i+1)); done; wait")
 	if !strings.Contains(out, "fork") {
 		t.Errorf("want fork failure, got: %s", out)
 	}

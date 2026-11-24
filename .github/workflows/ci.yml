@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           # Build with the newest patched Go release. go.mod's "go 1.23" is
           # only the minimum language version; an old toolchain ships known
@@ -37,7 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           # Build with the newest patched Go release. go.mod's "go 1.23" is
           # only the minimum language version; an old toolchain ships known
@@ -57,7 +57,7 @@ jobs:
     needs: [lint, unit]
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           # Build with the newest patched Go release. go.mod's "go 1.23" is
           # only the minimum language version; an old toolchain ships known
@@ -83,7 +83,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           # Build with the newest patched Go release. go.mod's "go 1.23" is
           # only the minimum language version; an old toolchain ships known

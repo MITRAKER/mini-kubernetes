@@ -73,7 +73,7 @@ jobs:
             "$(which go)" test -count=1 -coverpkg=./... -coverprofile=coverage.out ./...
       - name: Enforce coverage threshold
         run: ./scripts/check-coverage.sh coverage.out 65
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: coverage.out
